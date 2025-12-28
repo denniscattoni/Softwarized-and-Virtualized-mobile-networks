@@ -41,7 +41,7 @@ class SliceQosApp(app_manager.RyuApp):
 
     Operational assumption:
       - For baseline connectivity / loop avoidance you can still run:
-            ryu-manager ryu.app.simple_switch_stp_13 controller.slice_qos_app
+            ryu-manager controller.slice_qos_app
         Our app installs higher-priority rules for the latency slice traffic.
     """
 
