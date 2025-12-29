@@ -1,7 +1,7 @@
 # controller/slice_qos_app.py
 
 """
-SliceQosApp Orchestrator
+SliceQosApp Orchestrator (Architecture 2)
 
 This is the ONLY RyuApp loaded by ryu-manager.
 
@@ -13,7 +13,8 @@ Responsibilities:
 
 Design goals:
 - Keep behavior of the existing low-latency slice unchanged.
-- Add feature flags to enable/disable slices for debugging and incremental development.
+- Add a high-throughput slice with widest-path routing and VIP NAT, without interfering
+  with the low-latency slice.
 """
 
 from __future__ import annotations
@@ -31,31 +32,41 @@ from slice_config import SLICES
 from graph_state import TopologyGraph
 from flow_utils import add_flow
 
-from link_config import LINK_PARAMS, PORT_TO_NEIGHBOR
+from link_config import LINK_PARAMS, PORT_TO_NEIGHBOR, NEXT_HOP_PORT
 from latency_slice import LatencySliceManager
+from throughput_slice import ThroughputSliceManager
 
 
 # -------------------------------------------------------------------
 # Feature flags (debug-friendly)
 # -------------------------------------------------------------------
-ENABLE_LATENCY_SLICE = True
-ENABLE_THROUGHPUT_SLICE = False  # placeholder for future slice
+ENABLE_LATENCY_SLICE = False
+ENABLE_THROUGHPUT_SLICE = True
+
+
+# -------------------------------------------------------------------
+# Flow priorities (OpenFlow)
+# -------------------------------------------------------------------
+# Higher number => higher priority.
+#
+# Policy:
+#  - low-latency slice must win over high-throughput slice
+#  - best-effort remains below both (table-miss, L2, etc.)
+SLICE_FLOW_PRIORITY_LATENCY = 20
+SLICE_FLOW_PRIORITY_THROUGHPUT = 10
 
 
 class SliceQosApp(app_manager.RyuApp):
     """
     SliceQosApp orchestrator.
 
-    Key idea:
+    Key idea (Architecture 2):
       - Do NOT use Ryu topology discovery (--observe-links, LLDP).
       - Treat topology as known a priori via LINK_PARAMS.
       - Consider topology "ready" when all expected switches have connected.
     """
 
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
-
-    # Global slice flow priority (must be higher than any baseline forwarding app, if present)
-    SLICE_FLOW_PRIORITY = 10
 
     def __init__(self, *args, **kwargs):
         super(SliceQosApp, self).__init__(*args, **kwargs)
@@ -64,7 +75,7 @@ class SliceQosApp(app_manager.RyuApp):
         self.logger.setLevel(logging.INFO)
 
         # Shared controller state
-        self.datapaths = {}  # dpid -> datapath
+        self.datapaths = {}
         self.topo = TopologyGraph()
         self.slices = SLICES
 
@@ -75,18 +86,29 @@ class SliceQosApp(app_manager.RyuApp):
 
         self._init_logical_graph_from_config()
 
-        # Slice managers (enabled/disabled by flags)
+        # Slice managers
         self.latency_mgr = None
         if ENABLE_LATENCY_SLICE:
             assert "latency" in self.slices, "ENABLE_LATENCY_SLICE=True but SLICES['latency'] missing"
-            from link_config import NEXT_HOP_PORT  # keep import local for clarity
             self.latency_mgr = LatencySliceManager(
                 topo=self.topo,
                 datapaths=self.datapaths,
                 slice_conf=self.slices["latency"],
                 next_hop_port=NEXT_HOP_PORT,
                 logger=self.logger,
-                flow_priority=self.SLICE_FLOW_PRIORITY,
+                flow_priority=SLICE_FLOW_PRIORITY_LATENCY,
+            )
+
+        self.throughput_mgr = None
+        if ENABLE_THROUGHPUT_SLICE:
+            assert "throughput" in self.slices, "ENABLE_THROUGHPUT_SLICE=True but SLICES['throughput'] missing"
+            self.throughput_mgr = ThroughputSliceManager(
+                topo=self.topo,
+                datapaths=self.datapaths,
+                slice_conf=self.slices["throughput"],
+                next_hop_port=NEXT_HOP_PORT,
+                logger=self.logger,
+                flow_priority=SLICE_FLOW_PRIORITY_THROUGHPUT,
             )
 
         # Monitor loop
@@ -100,6 +122,10 @@ class SliceQosApp(app_manager.RyuApp):
             "Enabled slices: latency=%s throughput=%s",
             ENABLE_LATENCY_SLICE, ENABLE_THROUGHPUT_SLICE,
         )
+        self.logger.info(
+            "Flow priorities: latency=%s throughput=%s",
+            SLICE_FLOW_PRIORITY_LATENCY, SLICE_FLOW_PRIORITY_THROUGHPUT,
+        )
 
     # ------------------------------------------------------------------
     # Bootstrap / expected topology
@@ -110,14 +136,20 @@ class SliceQosApp(app_manager.RyuApp):
             s.add(u)
             s.add(v)
 
-        # Only require slice endpoints for slices that are enabled
         if ENABLE_LATENCY_SLICE:
             conf = self.slices.get("latency")
             assert conf is not None, "Missing SLICES['latency']"
             s.add(conf["ingress_switch"])
             s.add(conf["egress_switch"])
 
-        # throughput slice endpoints will be added once implemented/enabled
+        if ENABLE_THROUGHPUT_SLICE:
+            conf = self.slices.get("throughput")
+            assert conf is not None, "Missing SLICES['throughput']"
+            s.add(conf["ingress_switch"])
+            # We may target either remote or closest backend; require both edge switches.
+            s.add(conf["remote_backend"]["egress_switch"])
+            s.add(conf["closest_backend"]["egress_switch"])
+
         return s
 
     def _init_logical_graph_from_config(self):
@@ -140,6 +172,9 @@ class SliceQosApp(app_manager.RyuApp):
 
         if ENABLE_LATENCY_SLICE and self.latency_mgr is not None:
             self.latency_mgr.recompute_path(reason="bootstrap_all_switches_connected")
+
+        if ENABLE_THROUGHPUT_SLICE and self.throughput_mgr is not None:
+            self.throughput_mgr.recompute_path(reason="bootstrap_all_switches_connected")
 
         self.bootstrap_done = True
 
@@ -168,7 +203,7 @@ class SliceQosApp(app_manager.RyuApp):
         ofproto = dp.ofproto
         parser = dp.ofproto_parser
 
-        # Table-miss -> controller (needed if you implement ARP/L2/routing logic yourself)
+        # Table-miss -> controller
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
 
@@ -200,17 +235,21 @@ class SliceQosApp(app_manager.RyuApp):
         is_down = bool(msg.desc.state & ofproto.OFPPS_LINK_DOWN)
 
         # Determine whether slice paths are affected BEFORE applying topology updates.
-        latency_path = None
         latency_affected = False
         if ENABLE_LATENCY_SLICE and self.latency_mgr is not None:
-            latency_path = self.slices["latency"].get("current_path")
+            p = self.slices["latency"].get("current_path")
             latency_affected = (
-                    self._edge_in_path((dpid, nbr), latency_path)
-                    or self._edge_in_path((nbr, dpid), latency_path)
+                self._edge_in_path((dpid, nbr), p) or self._edge_in_path((nbr, dpid), p)
+            )
+
+        throughput_affected = False
+        if ENABLE_THROUGHPUT_SLICE and self.throughput_mgr is not None:
+            p = self.slices["throughput"].get("current_path")
+            throughput_affected = (
+                self._edge_in_path((dpid, nbr), p) or self._edge_in_path((nbr, dpid), p)
             )
 
         if is_down:
-            # Apply DOWN to logical graph (both directions if modeled).
             if (dpid, nbr) in LINK_PARAMS:
                 self.topo.remove_link(dpid, nbr)
             if (nbr, dpid) in LINK_PARAMS:
@@ -218,12 +257,13 @@ class SliceQosApp(app_manager.RyuApp):
 
             self.logger.warning("Link DOWN via port status: %s(port %s) <-> %s", dpid, port_no, nbr)
 
-            # Recompute ONLY if the current path is affected (Arch2 policy).
             if ENABLE_LATENCY_SLICE and self.latency_mgr is not None and latency_affected:
                 self.latency_mgr.on_path_affected(reason="port_down_on_current_path")
 
+            if ENABLE_THROUGHPUT_SLICE and self.throughput_mgr is not None and throughput_affected:
+                self.throughput_mgr.on_path_affected(reason="port_down_on_current_path")
+
         else:
-            # Apply UP to logical graph (both directions if modeled).
             if (dpid, nbr) in LINK_PARAMS:
                 p = LINK_PARAMS[(dpid, nbr)]
                 self.topo.add_link(dpid, nbr, delay_ms=p["delay_ms"], capacity_mbps=p["capacity_mbps"])
@@ -234,14 +274,16 @@ class SliceQosApp(app_manager.RyuApp):
             self.logger.info("Link UP via port status: %s(port %s) <-> %s", dpid, port_no, nbr)
 
             # Conservative Arch2: no reroute on UP.
-            # Exception (recovery-safe):
-            # - if the slice is DISCONNECTED (current_path is None), trigger a recompute to restore connectivity.
+            # Exception: if a slice is DISCONNECTED, trigger recompute to restore connectivity.
             if ENABLE_LATENCY_SLICE and self.latency_mgr is not None:
                 if self.slices["latency"].get("current_path") is None:
-                    self.logger.info(
-                        "Latency slice recovery trigger: link is UP and slice is DISCONNECTED. Recomputing."
-                    )
+                    self.logger.info("Latency slice recovery trigger: link is UP and slice is DISCONNECTED. Recomputing.")
                     self.latency_mgr.recompute_path(reason="link_up_recovery")
+
+            if ENABLE_THROUGHPUT_SLICE and self.throughput_mgr is not None:
+                if self.slices["throughput"].get("current_path") is None:
+                    self.logger.info("Throughput slice recovery trigger: link is UP and slice is DISCONNECTED. Recomputing.")
+                    self.throughput_mgr.recompute_path(reason="link_up_recovery")
 
     def _edge_in_path(self, edge, path):
         if not path or len(path) < 2:
@@ -257,16 +299,12 @@ class SliceQosApp(app_manager.RyuApp):
           - Poll PortStats less frequently.
           - Poll ONLY switches that are relevant to currently-installed slice paths.
           - Trigger slice QoS checks after stats updates.
-
-        Notes:
-          - If there is no current_path yet for any enabled slice, we only run bootstrap logic.
         """
         MONITOR_INTERVAL_S = 10
 
         while True:
             self._bootstrap_if_ready()
 
-            # Build set of critical datapaths to poll based on enabled slices
             critical_dpids = []
 
             if ENABLE_LATENCY_SLICE and self.latency_mgr is not None:
@@ -274,7 +312,11 @@ class SliceQosApp(app_manager.RyuApp):
                 if p:
                     critical_dpids.extend(p)
 
-            # Remove duplicates while preserving order
+            if ENABLE_THROUGHPUT_SLICE and self.throughput_mgr is not None:
+                p = self.slices["throughput"].get("current_path")
+                if p:
+                    critical_dpids.extend(p)
+
             critical_dpids = list(dict.fromkeys(critical_dpids))
 
             if not critical_dpids:
@@ -287,9 +329,11 @@ class SliceQosApp(app_manager.RyuApp):
                     continue
                 self._request_port_stats(dp)
 
-            # QoS checks
             if ENABLE_LATENCY_SLICE and self.latency_mgr is not None:
                 self.latency_mgr.check_qos()
+
+            if ENABLE_THROUGHPUT_SLICE and self.throughput_mgr is not None:
+                self.throughput_mgr.check_qos()
 
             hub.sleep(MONITOR_INTERVAL_S)
 
@@ -315,7 +359,6 @@ class SliceQosApp(app_manager.RyuApp):
                 delta_tx = tx_bytes - last["tx_bytes"]
                 delta_t = now - last["time"]
                 if delta_tx < 0:
-                    # counter reset/wrap; ignore sample
                     continue
                 if delta_t > 0:
                     used_mbps = (delta_tx * 8.0) / (delta_t * 1e6)

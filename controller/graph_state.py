@@ -188,6 +188,106 @@ class TopologyGraph:
         assert math.isfinite(total), f"estimate_path_cost produced non-finite total: {total}"
         return float(total)
 
+
+    # ------------------------------------------------------------------
+    # Widest path (max-min) computation for throughput slicing
+    # ------------------------------------------------------------------
+    def _residual_capacity_mbps(self, u: int, v: int) -> float:
+        """
+        Residual capacity = capacity - used (EWMA-smoothed).
+        Hard-fail if metrics are missing/invalid.
+        """
+        info = self._require_metrics(u, v)
+        cap = float(info["capacity_mbps"])
+        used = float(info["used_mbps"])
+
+        res = cap - used
+        if res < 0.0:
+            res = 0.0
+        return float(res)
+
+    def estimate_path_bottleneck_mbps(self, path: List[int]) -> float:
+        """
+        Bottleneck residual capacity along a path (min residual on edges).
+        Hard-fail if any traversed edge lacks required metrics.
+        """
+        if not path or len(path) < 2:
+            return 0.0
+
+        b = float("inf")
+        for u, v in zip(path[:-1], path[1:]):
+            r = self._residual_capacity_mbps(u, v)
+            if r < b:
+                b = r
+
+        if b == float("inf"):
+            b = 0.0
+        return float(b)
+
+    def compute_widest_path(self, src_dpid: int, dst_dpid: int) -> Optional[List[int]]:
+        """
+        Compute a widest path (max-min) between src and dst.
+
+        Objective:
+          maximize the path bottleneck residual capacity:
+              bottleneck(path) = min_{(u,v) in path} residual(u,v)
+
+        Implementation:
+          Dijkstra-like widest-path algorithm:
+            - maximize "best bottleneck so far" per node
+            - relax using min(current_bottleneck, residual(edge))
+        """
+        if src_dpid not in self.G or dst_dpid not in self.G:
+            return None
+
+        import heapq
+
+        # best[v] = best bottleneck residual achievable from src to v
+        best: Dict[int, float] = {src_dpid: float("inf")}
+        parent: Dict[int, int] = {}
+
+        # max-heap via negative values
+        pq = [(-best[src_dpid], src_dpid)]
+
+        visited = set()
+
+        while pq:
+            neg_b, u = heapq.heappop(pq)
+            b_u = -neg_b
+
+            if u in visited:
+                continue
+            visited.add(u)
+
+            if u == dst_dpid:
+                break
+
+            for v in self.G.successors(u):
+                # Hard-fail if metrics missing for traversed edges
+                r = self._residual_capacity_mbps(u, v)
+                cand = min(b_u, r)
+
+                prev = best.get(v, -1.0)
+                if cand > prev:
+                    best[v] = cand
+                    parent[v] = u
+                    heapq.heappush(pq, (-cand, v))
+
+        if dst_dpid not in best:
+            return None
+
+        # Reconstruct path
+        path = [dst_dpid]
+        cur = dst_dpid
+        while cur != src_dpid:
+            if cur not in parent:
+                return None
+            cur = parent[cur]
+            path.append(cur)
+
+        path.reverse()
+        return path
+
     # ------------------------------------------------------------------
     # Convenience helpers
     # ------------------------------------------------------------------

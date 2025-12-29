@@ -34,23 +34,23 @@ Key assumption of Architecture 2:
 #   - restore a link when it transitions back to UP
 
 LINK_PARAMS = {
-    (2, 1): {"delay_ms": 5, "capacity_mbps": 10},
-    (1, 2): {"delay_ms": 5, "capacity_mbps": 10},
+    (2, 1): {"delay_ms": 5, "capacity_mbps": 12},
+    (1, 2): {"delay_ms": 5, "capacity_mbps": 12},
 
-    (3, 1): {"delay_ms": 5, "capacity_mbps": 10},
-    (1, 3): {"delay_ms": 5, "capacity_mbps": 10},
+    (3, 1): {"delay_ms": 5, "capacity_mbps": 12},
+    (1, 3): {"delay_ms": 5, "capacity_mbps": 12},
 
     (4, 1): {"delay_ms": 3, "capacity_mbps": 4},
     (1, 4): {"delay_ms": 3, "capacity_mbps": 4},
 
-    (5, 1): {"delay_ms": 10, "capacity_mbps": 10},
-    (1, 5): {"delay_ms": 10, "capacity_mbps": 10},
+    (5, 1): {"delay_ms": 10, "capacity_mbps": 7},
+    (1, 5): {"delay_ms": 10, "capacity_mbps": 7},
 
     (2, 4): {"delay_ms": 5, "capacity_mbps": 10},
     (4, 2): {"delay_ms": 5, "capacity_mbps": 10},
 
-    (3, 5): {"delay_ms": 5, "capacity_mbps": 10},
-    (5, 3): {"delay_ms": 5, "capacity_mbps": 10},
+    (3, 5): {"delay_ms": 5, "capacity_mbps": 7},
+    (5, 3): {"delay_ms": 5, "capacity_mbps": 7},
 }
 
 # -------------------------------------------------------------------
