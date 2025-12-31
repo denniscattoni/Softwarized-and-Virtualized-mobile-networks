@@ -15,17 +15,12 @@ Design choice (Architecture 2):
   - We keep per-link metrics (link_info) even when a link goes DOWN.
     remove_link() removes only the edge from the graph, not its stored metrics.
     This preserves EWMA state across link flaps and avoids cold-start effects.
-
-  - TODO (optional):
-      a stricter model where link_info only contains UP links,
-      introduce a separate "history cache" (e.g., self.link_history) and:
-        * on remove_link(): move metrics from link_info -> link_history
-        * on add_link(): restore metrics from link_history if present
 """
 
 from __future__ import annotations
 
 import math
+import heapq
 import networkx as nx
 from typing import Callable, Dict, Optional, Tuple, List, Any
 
@@ -147,7 +142,7 @@ class TopologyGraph:
     # ------------------------------------------------------------------
     # Path computation
     # ------------------------------------------------------------------
-    def compute_latency_path(self, src_dpid: int, dst_dpid: int, weight_fn: Optional[WeightFn] = None,) -> Optional[List[int]]:
+    def compute_latency_path(self, src_dpid: int, dst_dpid: int, weight_fn: Optional[WeightFn] = None) -> Optional[List[int]]:
         """
         Compute shortest path using Dijkstra.
         Hard-fail if any traversed edge lacks required metrics.
@@ -190,8 +185,137 @@ class TopologyGraph:
 
 
     # ------------------------------------------------------------------
-    # Widest path (max-min) computation for throughput slicing
+    # Widest path (max-min) computation for throughput slicing (BIDIRECTIONAL)
     # ------------------------------------------------------------------
+    def estimate_path_bottleneck_bidirectional_mbps(self, path: List[int]) -> float:
+        """
+        Bottleneck residual capacity along a path, using bidirectional safety:
+
+          hop_residual(u,v) = min(residual(u,v), residual(v,u))
+          bottleneck(path)  = min hop_residual along the path
+
+        This matches the reality of download-heavy traffic where reverse direction
+        (backend -> client) can dominate.
+        """
+        if not path or len(path) < 2:
+            return 0.0
+
+        b = float("inf")
+        for u, v in zip(path[:-1], path[1:]):
+            # Hard-fail if any metrics are missing
+            res_fwd = self._residual_capacity_mbps(u, v)
+            res_rev = self._residual_capacity_mbps(v, u)
+            hop_res = min(float(res_fwd), float(res_rev))
+            if hop_res < b:
+                b = hop_res
+
+        return 0.0 if b == float("inf") else float(b)
+
+    def compute_widest_path_bidirectional(self, src_dpid: int, dst_dpid: int) -> Optional[List[int]]:
+        """
+        Compute a widest path (max-min) between src and dst, using bidirectional safety.
+
+        Objective:
+          maximize bottleneck(path), where:
+            hop_residual(u,v) = min(residual(u,v), residual(v,u))
+            bottleneck(path)  = min hop_residual along path
+
+        Tie-breaks (deterministic):
+          1) higher bottleneck
+          2) fewer hops
+          3) lexicographically smaller node sequence
+        """
+        if src_dpid not in self.G or dst_dpid not in self.G:
+            return None
+
+        best_b: Dict[int, float] = {src_dpid: float("inf")}
+        best_hops: Dict[int, int] = {src_dpid: 0}
+        prev: Dict[int, int] = {}
+
+        # max-heap via negative bottleneck
+        pq = [(-best_b[src_dpid], best_hops[src_dpid], src_dpid)]
+        visited = set()
+
+        def _reconstruct(prev_map: Dict[int, int], src: int, node: int) -> Optional[List[int]]:
+            if node == src:
+                return [src]
+            if node not in prev_map:
+                return None
+            p = [node]
+            cur = node
+            guard = 0
+            while cur != src:
+                if cur not in prev_map:
+                    return None
+                cur = prev_map[cur]
+                p.append(cur)
+                guard += 1
+                assert guard < 10_000, "Path reconstruction guard triggered"
+            p.reverse()
+            return p
+
+        while pq:
+            neg_b, hops_u, u = heapq.heappop(pq)
+            b_u = -neg_b
+
+            if u in visited:
+                continue
+            visited.add(u)
+
+            if u == dst_dpid:
+                break
+
+            nbrs = list(self.G.successors(u))
+            nbrs.sort()
+
+            for v in nbrs:
+                # Bidirectional hop residual
+                r1 = self._residual_capacity_mbps(u, v)
+                r2 = self._residual_capacity_mbps(v, u)
+                hop_res = min(float(r1), float(r2))
+
+                cand_b = min(float(b_u), float(hop_res))
+                cand_hops = int(hops_u) + 1
+
+                old_b = best_b.get(v, -1.0)
+                old_h = best_hops.get(v, 10 ** 9)
+
+                improve = False
+                # (1) better bottleneck
+                if cand_b > old_b + 1e-9:
+                    improve = True
+                # (2) equal bottleneck -> fewer hops
+                elif abs(cand_b - old_b) <= 1e-9 and cand_hops < old_h:
+                    improve = True
+                # (3) equal bottleneck and hops -> lexicographic tie-break
+                elif abs(cand_b - old_b) <= 1e-9 and cand_hops == old_h:
+                    cand_path = _reconstruct(prev, src_dpid, u)
+                    old_path = _reconstruct(prev, src_dpid, v)
+                    if cand_path is not None:
+                        cand_path = cand_path + [v]
+                        if old_path is None or cand_path < old_path:
+                            improve = True
+
+                if improve:
+                    best_b[v] = cand_b
+                    best_hops[v] = cand_hops
+                    prev[v] = u
+                    heapq.heappush(pq, (-cand_b, cand_hops, v))
+
+        if dst_dpid not in best_b:
+            return None
+
+        # Reconstruct final path
+        path = [dst_dpid]
+        cur = dst_dpid
+        while cur != src_dpid:
+            assert cur in prev, f"Widest-path reconstruction failed: missing predecessor for {cur}"
+            cur = prev[cur]
+            path.append(cur)
+        path.reverse()
+        return path
+
+
     def _residual_capacity_mbps(self, u: int, v: int) -> float:
         """
         Residual capacity = capacity - used (EWMA-smoothed).
@@ -205,88 +329,6 @@ class TopologyGraph:
         if res < 0.0:
             res = 0.0
         return float(res)
-
-    def estimate_path_bottleneck_mbps(self, path: List[int]) -> float:
-        """
-        Bottleneck residual capacity along a path (min residual on edges).
-        Hard-fail if any traversed edge lacks required metrics.
-        """
-        if not path or len(path) < 2:
-            return 0.0
-
-        b = float("inf")
-        for u, v in zip(path[:-1], path[1:]):
-            r = self._residual_capacity_mbps(u, v)
-            if r < b:
-                b = r
-
-        if b == float("inf"):
-            b = 0.0
-        return float(b)
-
-    def compute_widest_path(self, src_dpid: int, dst_dpid: int) -> Optional[List[int]]:
-        """
-        Compute a widest path (max-min) between src and dst.
-
-        Objective:
-          maximize the path bottleneck residual capacity:
-              bottleneck(path) = min_{(u,v) in path} residual(u,v)
-
-        Implementation:
-          Dijkstra-like widest-path algorithm:
-            - maximize "best bottleneck so far" per node
-            - relax using min(current_bottleneck, residual(edge))
-        """
-        if src_dpid not in self.G or dst_dpid not in self.G:
-            return None
-
-        import heapq
-
-        # best[v] = best bottleneck residual achievable from src to v
-        best: Dict[int, float] = {src_dpid: float("inf")}
-        parent: Dict[int, int] = {}
-
-        # max-heap via negative values
-        pq = [(-best[src_dpid], src_dpid)]
-
-        visited = set()
-
-        while pq:
-            neg_b, u = heapq.heappop(pq)
-            b_u = -neg_b
-
-            if u in visited:
-                continue
-            visited.add(u)
-
-            if u == dst_dpid:
-                break
-
-            for v in self.G.successors(u):
-                # Hard-fail if metrics missing for traversed edges
-                r = self._residual_capacity_mbps(u, v)
-                cand = min(b_u, r)
-
-                prev = best.get(v, -1.0)
-                if cand > prev:
-                    best[v] = cand
-                    parent[v] = u
-                    heapq.heappush(pq, (-cand, v))
-
-        if dst_dpid not in best:
-            return None
-
-        # Reconstruct path
-        path = [dst_dpid]
-        cur = dst_dpid
-        while cur != src_dpid:
-            if cur not in parent:
-                return None
-            cur = parent[cur]
-            path.append(cur)
-
-        path.reverse()
-        return path
 
     # ------------------------------------------------------------------
     # Convenience helpers

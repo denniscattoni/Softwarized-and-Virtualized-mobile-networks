@@ -19,7 +19,6 @@ SLICES = {
         "objective": "min_delay",
 
         # Maximum acceptable estimated latency for the path (in ms)
-        # (this is a logical threshold: will compare the sum of per-link delays against it).
         "max_delay_ms": 30,
 
         "queue_id": 0,
@@ -63,13 +62,13 @@ SLICES = {
 
         # Client endpoint identity (used for L2 rewriting on reverse path)
         "client_ip": "10.0.0.1",
-        "client_mac": "00:00:00:00:00:01",  # TODO: verify in Mininet
+        "client_mac": "00:00:00:00:00:01",
 
         # Remote backend (srv2) identity
         "remote_backend": {
             "name": "srv2",
             "ip": "10.0.0.4",
-            "mac": "00:00:00:00:00:04",     # TODO: verify in Mininet
+            "mac": "00:00:00:00:00:04",
             "tcp_port": 8080,
             "egress_switch": 5,             # s5 is attached to srv2
             "egress_host_port": 1,          # s5-eth1 -> srv2 (host-facing)
@@ -79,7 +78,7 @@ SLICES = {
         "closest_backend": {
             "name": "srv1",
             "ip": "10.0.0.3",
-            "mac": "00:00:00:00:00:03",     # TODO: verify in Mininet
+            "mac": "00:00:00:00:00:03",
             "tcp_port": 8080,
             "egress_switch": 4,             # s4 is attached to srv1
             "egress_host_port": 1,          # s4-eth1 -> srv1 (host-facing)
@@ -93,5 +92,9 @@ SLICES = {
         "active_backend": "remote",         # "remote" or "closest"
         "state": "NORMAL_REMOTE",           # NORMAL_REMOTE, NORMAL_CLOSEST, MIGRATING, DISCONNECTED
         "current_path": None,
+
+        # NFV management plane (REST) for migration
+        "service_manager_url": "http://127.0.0.1:9090",
+        "migration_enabled": True,
     },
 }

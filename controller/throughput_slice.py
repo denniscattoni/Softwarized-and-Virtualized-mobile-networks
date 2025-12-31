@@ -7,50 +7,44 @@ This module MUST NOT define a RyuApp.
 It contains only policy/decision logic and flow programming for the "throughput" slice.
 
 Design goals:
-- Keep behavior deterministic and debuggable (hard-fail on missing config).
-- Use a max-min (widest-path) policy to maximize bottleneck residual throughput.
-- Implement SDN-based VIP NAT so the client targets a stable service IP independently
-  from the physical backend location (srv2 or srv1).
+- Deterministic and debuggable (hard-fail on missing config).
+- Max-min (widest-path) routing using bottleneck residual throughput.
+- SDN VIP NAT so the client targets a stable VIP regardless of backend location.
 
-Pipeline scope:
-- Step 1: VIP + SDN NAT flows (both backends can be ON for validation).
-- Step 2: Widest-path routing + QoS check (route-first).
-- Step 3: Service migration (start/stop) will be integrated later.
+Pipeline:
+- Step 1: VIP + SDN NAT flows
+- Step 2: Widest-path + QoS check (route-first)
+- Step 3: Service migration via REST (service_manager.py)
 """
 
 from __future__ import annotations
 
-import heapq
-import math
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
-from flow_utils import (
-    build_match_for_slice,
-    add_flow,
-    delete_flows_for_cookie,
-)
+from flow_utils import build_match_for_slice, add_flow, delete_flows_for_cookie
 
-
-COOKIE_THROUGHPUT = 0xB2_000001  # any non-zero constant identifying "our" throughput slice flows
+COOKIE_THROUGHPUT = 0xB2_000001
 COOKIE_MASK_ALL = 0xFFFFFFFFFFFFFFFF
 
 
 class ThroughputSliceManager:
     """
-    High-throughput slice policy:
+    Policy:
+      - Bootstrap: compute and install widest path toward active backend (default remote=srv2).
+      - Operational: recompute only when:
+          * QoS violation on current path, or
+          * link-down affects current path.
 
-    - Bootstrap:
-        * compute and install an initial widest path toward the active backend (default: remote=srv2).
+    Recovery-safe:
+      - If no path exists: current_path=None, delete flows, state=DISCONNECTED.
+      - On link-up: orchestrator triggers recompute only if DISCONNECTED.
 
-    - Operational:
-        * DO NOT recompute continuously.
-        * recompute only when:
-            - a link failure affects the current path, OR
-            - the current path bottleneck residual throughput violates the QoS threshold.
-
-    Recovery-safe behavior:
-      - If no path exists, set current_path=None and delete flows (DISCONNECTED state).
-      - On link-up, the orchestrator will trigger recompute only if DISCONNECTED.
+    Step 3 (migration):
+      - If active backend is REMOTE (srv2) and even the BEST possible path cannot satisfy QoS,
+        trigger REST switch to CLOSEST (srv1), then reinstall flows toward srv1 (VIP unchanged).
+      - No cooldown/streak: migration is immediate and one-way in this demo (no auto migrate back).
     """
 
     def __init__(
@@ -76,43 +70,51 @@ class ThroughputSliceManager:
         # Sanity checks (fail fast)
         assert self.slice_conf is not None, "ThroughputSliceManager: slice_conf is None"
         assert "ingress_switch" in self.slice_conf, "ThroughputSliceManager: missing ingress_switch"
+        assert "ingress_host_port" in self.slice_conf, "ThroughputSliceManager: missing ingress_host_port"
         assert "min_throughput_mbps" in self.slice_conf, "ThroughputSliceManager: missing min_throughput_mbps"
         assert "remote_backend" in self.slice_conf, "ThroughputSliceManager: missing remote_backend"
         assert "closest_backend" in self.slice_conf, "ThroughputSliceManager: missing closest_backend"
         assert "vip_ip" in self.slice_conf and "vip_mac" in self.slice_conf, "ThroughputSliceManager: missing VIP params"
         assert "client_ip" in self.slice_conf and "client_mac" in self.slice_conf, "ThroughputSliceManager: missing client identity"
 
+        # Step 3 REST API config
+        assert "service_manager_url" in self.slice_conf, "ThroughputSliceManager: missing service_manager_url"
+        assert "migration_enabled" in self.slice_conf, "ThroughputSliceManager: missing migration_enabled"
+
     # ------------------------------------------------------------------
     # Public entry points used by the orchestrator
     # ------------------------------------------------------------------
     def recompute_path(self, reason: str = "unspecified"):
         """
-        Compute and (re)install widest-path toward the active backend.
+        Compute and (re)install widest-path toward the ACTIVE backend.
 
         Widest-path objective:
-          maximize bottleneck residual capacity, where:
-              residual(u,v) = max(0, capacity_mbps - used_mbps_ewma)
-              bottleneck(path) = min residual(u,v) along the path
+          maximize bottleneck residual capacity, using bidirectional safety:
+            hop_residual(u,v) = min(residual(u,v), residual(v,u))
 
-        IMPORTANT (bidirectional safety):
-          For each hop (u,v), the effective residual is:
-              hop_residual = min(residual(u,v), residual(v,u))
-          This makes QoS detection consistent with real download-heavy traffic
-          (often dominates on the reverse direction).
-
-        If no path exists:
-          - enter DISCONNECTED state
-          - delete flows to avoid stale forwarding
+        If no path:
+          - if active is REMOTE and migration is enabled -> try migrate to CLOSEST and recompute
+          - else DISCONNECTED (clear flows)
         """
-        ingress = int(self.slice_conf["ingress_switch"])
         backend = self._get_active_backend_conf()
+        ingress = int(self.slice_conf["ingress_switch"])
         egress = int(backend["egress_switch"])
         thr_min = float(self.slice_conf["min_throughput_mbps"])
 
-        path = self._compute_widest_path_bidirectional(ingress, egress)
+        path = self.topo.compute_widest_path_bidirectional(ingress, egress)
+
+        # -------------------- NO PATH --------------------
         if path is None:
+            if self._is_remote_active() and self._migration_enabled():
+                self.logger.warning(
+                    "Throughput: no path to REMOTE backend (%s). Trying migration to CLOSEST. [reason=%s]",
+                    backend.get("name", "?"), reason,
+                )
+                if self._migrate_to("closest", reason=f"no_path_to_remote:{reason}"):
+                    return self.recompute_path(reason="after_migration_no_path")
+
             self.logger.warning(
-                "Throughput slice DISCONNECTED: no path from %s to %s. Clearing current_path and deleting slice flows. "
+                "Throughput DISCONNECTED: no path from %s to %s. Clearing current_path and deleting slice flows. "
                 "[backend=%s reason=%s]",
                 ingress, egress, backend.get("name", "?"), reason,
             )
@@ -121,95 +123,98 @@ class ThroughputSliceManager:
             self.delete_flows()
             return
 
-        bottleneck = self._estimate_path_bottleneck_bidirectional_mbps(path)
-        old_path = self.slice_conf.get("current_path")
+        bottleneck = self.topo.estimate_path_bottleneck_bidirectional_mbps(path)
 
-        # Always log recompute outcome (this is the core signal for widest-path validation).
         self.logger.info(
             "Throughput recompute: selected path=%s bottleneck=%.2f Mbps (min=%.2f Mbps) backend=%s state=%s [reason=%s]",
-            path,
-            bottleneck,
-            thr_min,
-            backend.get("name", "?"),
-            self.slice_conf.get("state", "?"),
-            reason,
+            path, bottleneck, thr_min, backend.get("name", "?"), self.slice_conf.get("state", "?"), reason
         )
 
-        # If path is unchanged, do nothing (stability by construction).
+        # -------------------- BEST PATH STILL UNSATISFIED --------------------
+        if bottleneck < thr_min:
+            self.logger.warning(
+                "Throughput: BEST path to backend=%s violates QoS (bottleneck=%.2f < %.2f).",
+                backend.get("name", "?"), bottleneck, thr_min
+            )
+            self._log_path_residuals(path, prefix="Throughput best-path residuals (QoS unsatisfied)")
+
+            # Immediate migration trigger only when REMOTE is active
+            if self._is_remote_active() and self._migration_enabled():
+                self.logger.warning("Throughput: triggering migration to CLOSEST (no cooldown).")
+                if self._migrate_to("closest", reason=f"qos_unsatisfied_best_path:{reason}"):
+                    return self.recompute_path(reason="after_migration_qos_unsatisfied")
+
+            # If closest already active (or migration disabled), keep best route anyway.
+
+        # -------------------- INSTALL FLOWS IF PATH CHANGED --------------------
+        old_path = self.slice_conf.get("current_path")
         if old_path == path:
-            if reason in ("qos_violation", "port_down_on_current_path"):
-                self._log_path_residuals(path, prefix="Throughput path unchanged")
             return
 
-        # Path changed -> install deterministic flows for the selected backend
         self._log_path_residuals(path, prefix="Throughput installing new path")
         self.delete_flows()
         self.install_flows(path, backend)
         self.slice_conf["current_path"] = path
 
-        # State bookkeeping (migration will refine this later)
-        if self.slice_conf.get("active_backend") == "closest":
-            self.slice_conf["state"] = "NORMAL_CLOSEST"
-        else:
-            self.slice_conf["state"] = "NORMAL_REMOTE"
+        self.slice_conf["state"] = "NORMAL_CLOSEST" if self.slice_conf.get("active_backend") == "closest" else "NORMAL_REMOTE"
 
     def check_qos(self):
         """
-        Evaluate QoS on the current path and recompute if violated.
+        Evaluate QoS on the CURRENT path; if violated -> recompute.
 
-        QoS condition:
-          bottleneck_residual_mbps(path) >= min_throughput_mbps
-
-        IMPORTANT (bidirectional safety):
-          bottleneck is computed using hop_residual = min(res(u,v), res(v,u)).
+        QoS: bottleneck_residual_mbps(path) >= min_throughput_mbps
+        (bidirectional safety metric).
         """
+
+        # Don't poll ServiceManager until all switches registered
+        if self.slice_conf.get("current_path") is None:
+            return
+
+        # Intercept if someone performed manual migration of the service and resync
+        # If a manual placement change is detected, this will:
+        #   - update active_backend/state
+        #   - delete old flows
+        #   - recompute/install new flows
+        if self._sync_backend_from_service_manager():
+            return
+
         path = self.slice_conf.get("current_path")
         if not path:
             return
 
         thr_min = float(self.slice_conf["min_throughput_mbps"])
-        b = self._estimate_path_bottleneck_bidirectional_mbps(path)
+        b = self.topo.estimate_path_bottleneck_bidirectional_mbps(path)
 
         if b >= thr_min:
             return
 
         self.logger.warning(
-            "Throughput slice QoS VIOLATION: path=%s bottleneck=%.2f Mbps < %.2f Mbps. Recomputing.",
-            path, b, thr_min,
+            "Throughput QoS VIOLATION: path=%s bottleneck=%.2f Mbps < %.2f Mbps. Recomputing.",
+            path, b, thr_min
         )
         self._log_path_residuals(path, prefix="Throughput QoS violation on current path")
         self.recompute_path(reason="qos_violation")
 
     def on_path_affected(self, reason: str = "path_affected"):
-        """
-        Called by the orchestrator when it detects that a link-down event affects the current path.
-        """
         self.logger.warning("Current throughput path affected. Recomputing. [reason=%s]", reason)
         self.recompute_path(reason=reason)
 
     def delete_flows(self):
-        """
-        Remove only the flows owned by this slice (cookie-scoped).
-        """
         for _, dp in self.datapaths.items():
             delete_flows_for_cookie(dp, cookie=self.cookie, cookie_mask=COOKIE_MASK_ALL)
 
+    # ------------------------------------------------------------------
+    # Flow programming (VIP NAT + routing)
+    # ------------------------------------------------------------------
     def install_flows(self, path: List[int], backend_conf: Dict[str, Any]):
         """
-        Install bidirectional slice rules with SDN-based VIP NAT:
+        Install bidirectional slice rules with VIP NAT:
 
-          FORWARD:  c1 -> VIP:8080  (DNAT VIP->backend on egress edge)
-          REVERSE:  backend -> c1   (SNAT backend->VIP on ingress edge)
+          FORWARD:  c1 -> VIP:8080  (DNAT VIP->backend on backend edge switch)
+          REVERSE:  backend -> c1   (SNAT backend->VIP on ingress edge switch)
 
-        Notes:
-          - We keep the same directional-graph simplification:
-              reverse path = reversed(forward path).
-          - We do not rely on L2 learning; flows are fully deterministic.
-
-        Required in slice_config.py:
-          - ingress_host_port
-          - backend_conf: egress_host_port, ip, mac, tcp_port
-          - vip_ip, vip_mac, client_ip, client_mac
+        IMPORTANT:
+          reverse match includes backend_ip, so after migration flows MUST be reinstalled.
         """
         ingress = int(self.slice_conf["ingress_switch"])
         ingress_host_port = int(self.slice_conf["ingress_host_port"])
@@ -236,26 +241,16 @@ class ThroughputSliceManager:
                 continue
 
             parser = dp.ofproto_parser
-
-            # Match on the slice forward definition (client -> VIP:8080)
             fwd_match = build_match_for_slice(parser, self.slice_conf)
 
             if dpid == egress_switch:
-                # Last switch: DNAT VIP->backend and deliver to backend host
                 actions = [
                     parser.OFPActionSetField(ipv4_dst=backend_ip),
                     parser.OFPActionSetField(eth_dst=backend_mac),
                     parser.OFPActionOutput(int(egress_host_port)),
                 ]
-                add_flow(
-                    dp,
-                    priority=prio,
-                    match=fwd_match,
-                    actions=actions,
-                    idle_timeout=0,
-                    hard_timeout=0,
-                    cookie=self.cookie,
-                )
+                add_flow(dp, priority=prio, match=fwd_match, actions=actions,
+                         idle_timeout=0, hard_timeout=0, cookie=self.cookie)
                 continue
 
             if idx >= len(path) - 1:
@@ -268,15 +263,8 @@ class ThroughputSliceManager:
                 continue
 
             actions = [parser.OFPActionOutput(int(out_port))]
-            add_flow(
-                dp,
-                priority=prio,
-                match=fwd_match,
-                actions=actions,
-                idle_timeout=0,
-                hard_timeout=0,
-                cookie=self.cookie,
-            )
+            add_flow(dp, priority=prio, match=fwd_match, actions=actions,
+                     idle_timeout=0, hard_timeout=0, cookie=self.cookie)
 
         # ---------- REVERSE (backend -> client) ----------
         rev_path = list(reversed(path))
@@ -286,27 +274,17 @@ class ThroughputSliceManager:
                 continue
 
             parser = dp.ofproto_parser
-
-            # Reverse match must match packets from REAL backend IP to client IP.
             rev_match = self._build_reverse_match_for_backend(parser, backend_ip, backend_tcp_port, client_ip)
 
             if dpid == ingress:
-                # Last hop in reverse: SNAT backend->VIP and deliver to client host.
                 actions = [
                     parser.OFPActionSetField(ipv4_src=vip_ip),
                     parser.OFPActionSetField(eth_src=vip_mac),
                     parser.OFPActionSetField(eth_dst=client_mac),
                     parser.OFPActionOutput(int(ingress_host_port)),
                 ]
-                add_flow(
-                    dp,
-                    priority=prio,
-                    match=rev_match,
-                    actions=actions,
-                    idle_timeout=0,
-                    hard_timeout=0,
-                    cookie=self.cookie,
-                )
+                add_flow(dp, priority=prio, match=rev_match, actions=actions,
+                         idle_timeout=0, hard_timeout=0, cookie=self.cookie)
                 continue
 
             if idx >= len(rev_path) - 1:
@@ -319,24 +297,146 @@ class ThroughputSliceManager:
                 continue
 
             actions = [parser.OFPActionOutput(int(out_port))]
-            add_flow(
-                dp,
-                priority=prio,
-                match=rev_match,
-                actions=actions,
-                idle_timeout=0,
-                hard_timeout=0,
-                cookie=self.cookie,
+            add_flow(dp, priority=prio, match=rev_match, actions=actions,
+                     idle_timeout=0, hard_timeout=0, cookie=self.cookie)
+
+    # ------------------------------------------------------------------
+    # Step 3: Migration helpers
+    # ------------------------------------------------------------------
+    def _migration_enabled(self) -> bool:
+        return bool(self.slice_conf.get("migration_enabled", False))
+
+    def _is_remote_active(self) -> bool:
+        return self.slice_conf.get("active_backend", "remote") == "remote"
+
+    def _migrate_to(self, target: str, reason: str) -> bool:
+        """
+        Trigger NFV migration via REST and update local state.
+
+        target: "closest" or "remote"
+        """
+        assert target in ("closest", "remote"), f"Throughput: invalid migration target={target}"
+
+        if self.slice_conf.get("active_backend") == target:
+            return True
+
+        to_backend = "srv1" if target == "closest" else "srv2"
+
+        self.logger.warning(
+            "MIGRATION: switching service to %s (target=%s). VIP unchanged. [reason=%s]",
+            to_backend, target, reason
+        )
+
+        self.slice_conf["state"] = "MIGRATING"
+
+        ok = self._rest_switch_backend(to_backend)
+        if not ok:
+            self.logger.warning("MIGRATION FAILED: REST switch to %s failed.", to_backend)
+            self.slice_conf["state"] = "NORMAL_CLOSEST" if self.slice_conf.get("active_backend") == "closest" else "NORMAL_REMOTE"
+            return False
+
+        self.slice_conf["active_backend"] = target
+        self.slice_conf["state"] = "NORMAL_CLOSEST" if target == "closest" else "NORMAL_REMOTE"
+
+        self.logger.warning("MIGRATION OK: active_backend=%s (REST switched to %s)", target, to_backend)
+        return True
+
+    def _rest_switch_backend(self, to_backend: str) -> bool:
+        """
+        POST /service/switch?to=srv1|srv2
+        Stdlib only (no requests).
+        """
+        base = str(self.slice_conf["service_manager_url"]).rstrip("/")
+        qs = urlencode({"to": to_backend})
+        url = f"{base}/service/switch?{qs}"
+
+        try:
+            req = Request(url, method="POST")
+            with urlopen(req, timeout=2) as resp:
+                body = resp.read().decode("utf-8", errors="replace").strip()
+                if resp.status != 200:
+                    self.logger.warning("ServiceManager REST error: status=%s body=%s", resp.status, body)
+                    return False
+                self.logger.info("ServiceManager REST: %s", body)
+                return True
+        except Exception as e:
+            self.logger.warning("ServiceManager REST exception: %s", e)
+            return False
+
+    def _sync_backend_from_service_manager(self) -> bool:
+        """
+        Detect manual service placement changes by polling ServiceManager /service/status.
+
+        If placement differs from slice_conf['active_backend'], reconcile by:
+          - updating active_backend/state
+          - clearing current_path
+          - deleting old flows
+          - recomputing + installing new flows toward the detected backend
+
+        Returns True if a change was detected and handled (i.e., we triggered a resync).
+        """
+
+        base = str(self.slice_conf["service_manager_url"]).rstrip("/")
+        url = f"{base}/service/status"
+
+        # Fetch status
+        try:
+            req = Request(url, method="GET")
+            with urlopen(req, timeout=2) as resp:
+                body = resp.read().decode("utf-8", errors="replace").strip()
+                status = getattr(resp, "status", None)
+                if status is not None and int(status) != 200:
+                    self.logger.warning("ServiceManager status error: status=%s body=%s", status, body)
+                    return False
+        except Exception as e:
+            self.logger.warning("ServiceManager status exception: %s", e)
+            return False
+
+        # Expected body example:
+        #   "srv1=ON srv2=OFF"
+        srv1_on = "srv1=ON" in body
+        srv2_on = "srv2=ON" in body
+
+        # Ambiguous / invalid states
+        # - both OFF: nothing to serve; don't thrash flows here
+        # - both ON: ambiguous placement (could be transitional); avoid oscillations
+        if srv1_on and srv2_on:
+            self.logger.warning(
+                "ServiceManager reports BOTH backends ON (ambiguous): '%s'. Skipping sync.", body
             )
+            return False
+
+        if (not srv1_on) and (not srv2_on):
+            self.logger.warning(
+                "ServiceManager reports BOTH backends OFF (no service): '%s'. Skipping sync.", body
+            )
+            return False
+
+        # Exactly one ON -> infer placement
+        detected = "closest" if srv1_on else "remote"
+        current = self.slice_conf.get("active_backend", "remote")
+
+        if detected == current:
+            return False
+
+        # Reconcile controller state + dataplane
+        self.logger.warning(
+            "MANUAL PLACEMENT DETECTED from ServiceManager: %s (was %s). Reconciling flows.",
+            detected, current
+        )
+
+        self.slice_conf["active_backend"] = detected
+        self.slice_conf["state"] = "NORMAL_CLOSEST" if detected == "closest" else "NORMAL_REMOTE"
+
+        # Clear dataplane state and force a clean reinstall toward the new backend
+        self.slice_conf["current_path"] = None
+        self.recompute_path(reason="manual_switch_detected")
+        return True
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
     def _get_active_backend_conf(self) -> Dict[str, Any]:
-        """
-        Return the currently active backend configuration dict.
-        Hard-fail if active_backend is invalid.
-        """
         ab = self.slice_conf.get("active_backend", "remote")
         if ab == "remote":
             return self.slice_conf["remote_backend"]
@@ -345,247 +445,34 @@ class ThroughputSliceManager:
         raise AssertionError(f"ThroughputSliceManager: invalid active_backend={ab}")
 
     def _build_reverse_match_for_backend(self, parser, backend_ip: str, backend_port: int, client_ip: str):
-        """
-        Reverse match for backend->client traffic:
-
-          ipv4_src = backend_ip
-          ipv4_dst = client_ip
-          ip_proto = TCP
-          tcp_src  = backend_port (8080)
-
-        IMPORTANT:
-          Do NOT call build_reverse_match_for_slice() here.
-          That helper swaps src/dst and would invert this match again.
-        """
         return parser.OFPMatch(
-            eth_type=0x0800,         # IPv4
+            eth_type=0x0800,
             ipv4_src=str(backend_ip),
             ipv4_dst=str(client_ip),
-            ip_proto=6,              # TCP
+            ip_proto=6,
             tcp_src=int(backend_port),
         )
 
-    def _edge_residual_mbps(self, u: int, v: int) -> Optional[float]:
-        """
-        Residual capacity on a directed edge (u,v):
-
-          residual = max(0, capacity_mbps - used_mbps)
-
-        Return None if metrics are missing.
-        """
-        m = self.topo.get_link_metrics(u, v)
-        if m is None:
-            return None
-
-        cap = float(m["capacity_mbps"])
-        used = float(m["used_mbps"])
-        res = cap - used
-        if res < 0.0:
-            res = 0.0
-        return float(res)
-
-    def _estimate_path_bottleneck_bidirectional_mbps(self, path: List[int]) -> float:
-        """
-        Compute bottleneck residual throughput for the path using a bidirectional safety rule.
-
-        For each hop (u,v), compute:
-            res_fwd = residual(u,v)
-            res_rev = residual(v,u)
-            hop_residual = min(res_fwd, res_rev)
-
-        Then:
-            bottleneck(path) = min hop_residual along the path
-
-        If any required metrics are missing, hard-fail: this is a controlled lab setup.
-        """
-        assert path is not None and len(path) >= 2, "ThroughputSliceManager: invalid path for bottleneck computation"
-
-        edges = list(zip(path[:-1], path[1:]))
-        bottleneck = float("inf")
-
-        for (u, v) in edges:
-            res_fwd = self._edge_residual_mbps(u, v)
-            res_rev = self._edge_residual_mbps(v, u)
-
-            assert res_fwd is not None, f"Missing metrics for edge {u}->{v}"
-            assert res_rev is not None, f"Missing metrics for edge {v}->{u}"
-
-            hop_res = min(float(res_fwd), float(res_rev))
-            bottleneck = min(bottleneck, hop_res)
-
-        if bottleneck == float("inf"):
-            return 0.0
-        return float(bottleneck)
-
-    def _compute_widest_path_bidirectional(self, src: int, dst: int) -> Optional[List[int]]:
-        """
-        Compute a widest-path (max-min) route using a bidirectional residual metric,
-        with deterministic tie-breaks.
-
-        Objective (primary):
-          - maximize bottleneck(path) where each hop uses:
-                hop_residual(u,v) = min(residual(u,v), residual(v,u))
-            and:
-                bottleneck(path) = min hop_residual along the path
-
-        Deterministic tie-breaks:
-          1) maximize bottleneck
-          2) minimize hop count
-          3) minimize path lexicographically (stable across runs)
-
-        Returns:
-          - list of DPIDs [src, ..., dst] if a path exists
-          - None if no path exists (or src/dst not in graph)
-        """
-        if src not in self.topo.G or dst not in self.topo.G:
-            return None
-
-        import heapq
-        import math
-
-        # best_b[v] = best bottleneck found so far for v
-        # best_hops[v] = hopcount for that best bottleneck (tie-break #2)
-        best_b: Dict[int, float] = {src: float("inf")}
-        best_hops: Dict[int, int] = {src: 0}
-        prev: Dict[int, int] = {}
-
-        # Priority queue:
-        #   - maximize bottleneck  => store -bottleneck
-        #   - minimize hops       => store hops
-        #   - minimize lexicographic path => handled by stable neighbor ordering + final path compare
-        heap = [(-best_b[src], best_hops[src], src)]
-
-        visited = set()
-
-        while heap:
-            neg_b, hops_u, u = heapq.heappop(heap)
-            b_u = -neg_b
-
-            if u in visited:
-                continue
-            visited.add(u)
-
-            if u == dst:
-                break
-
-            # Deterministic neighbor order helps ensure stable results
-            nbrs = list(self.topo.G.successors(u))
-            nbrs.sort()
-
-            for v in nbrs:
-                res_fwd = self._edge_residual_mbps(u, v)
-                res_rev = self._edge_residual_mbps(v, u)
-
-                assert res_fwd is not None, f"Missing metrics for edge {u}->{v}"
-                assert res_rev is not None, f"Missing metrics for edge {v}->{u}"
-
-                hop_res = min(float(res_fwd), float(res_rev))
-                assert math.isfinite(hop_res) and hop_res >= 0.0, f"Invalid hop_residual for {u}<->{v}: {hop_res}"
-
-                cand_b = min(float(b_u), float(hop_res))
-                cand_hops = int(hops_u) + 1
-
-                old_b = best_b.get(v, -1.0)
-                old_h = best_hops.get(v, 10 ** 9)
-
-                improve = False
-
-                # (1) better bottleneck
-                if cand_b > old_b + 1e-9:
-                    improve = True
-                # (2) equal bottleneck -> fewer hops
-                elif abs(cand_b - old_b) <= 1e-9 and cand_hops < old_h:
-                    improve = True
-                # (3) equal bottleneck and hops -> lexicographic path tie-break
-                elif abs(cand_b - old_b) <= 1e-9 and cand_hops == old_h:
-                    # Compare candidate path vs existing path lexicographically
-                    cand_path = self._reconstruct_path_candidate(prev, src, u, v)
-                    old_path = self._reconstruct_path_existing(prev, src, v)
-                    if old_path is None or cand_path < old_path:
-                        improve = True
-
-                if improve:
-                    best_b[v] = cand_b
-                    best_hops[v] = cand_hops
-                    prev[v] = u
-                    heapq.heappush(heap, (-cand_b, cand_hops, v))
-
-        if dst not in best_b:
-            return None
-
-        # Reconstruct final path
-        path = [dst]
-        cur = dst
-        while cur != src:
-            assert cur in prev, f"Widest-path reconstruction failed: missing predecessor for {cur}"
-            cur = prev[cur]
-            path.append(cur)
-
-        path.reverse()
-        return path
-
-    def _reconstruct_path_existing(self, prev: Dict[int, int], src: int, node: int) -> Optional[List[int]]:
-        """
-        Reconstruct current best path to 'node' using 'prev'.
-        Return None if reconstruction fails.
-        """
-        if node == src:
-            return [src]
-        if node not in prev:
-            return None
-
-        path = [node]
-        cur = node
-        guard = 0
-
-        while cur != src:
-            if cur not in prev:
-                return None
-            cur = prev[cur]
-            path.append(cur)
-            guard += 1
-            assert guard < 10_000, "Path reconstruction guard triggered"
-
-        path.reverse()
-        return path
-
-    def _reconstruct_path_candidate(self, prev: Dict[int, int], src: int, u: int, v: int) -> List[int]:
-        """
-        Build candidate path for tie-break comparison:
-          path_to_u + [v]
-        Assumes u is reachable (visited in algorithm), thus reconstructable.
-        """
-        path_u = self._reconstruct_path_existing(prev, src, u)
-        assert path_u is not None, f"Candidate reconstruction failed: missing path to {u}"
-        return path_u + [v]
-
     def _log_path_residuals(self, path: List[int], prefix: str = "Path residuals"):
-        """
-        Debug helper: print residual capacity per edge on the given path.
-
-        IMPORTANT (bidirectional safety):
-          For each hop (u,v) we log both residuals and the effective hop residual:
-              hop_residual = min(res(u,v), res(v,u))
-        """
-        try:
-            edges = list(zip(path[:-1], path[1:]))
-        except Exception:
+        if not self.slice_conf.get("log_metrics", False):
             return
 
         parts = []
-        for (u, v) in edges:
-            res_fwd = self._edge_residual_mbps(u, v)
-            res_rev = self._edge_residual_mbps(v, u)
-
-            if res_fwd is None or res_rev is None:
+        for (u, v) in zip(path[:-1], path[1:]):
+            m_fwd = self.topo.get_link_metrics(u, v)
+            m_rev = self.topo.get_link_metrics(v, u)
+            if m_fwd is None or m_rev is None:
                 parts.append(f"{u}<->{v}:MISSING")
                 continue
 
-            hop_res = min(float(res_fwd), float(res_rev))
+            res_fwd = float(m_fwd["capacity_mbps"]) - float(m_fwd["used_mbps"])
+            res_rev = float(m_rev["capacity_mbps"]) - float(m_rev["used_mbps"])
+            if res_fwd < 0.0:
+                res_fwd = 0.0
+            if res_rev < 0.0:
+                res_rev = 0.0
 
-            # Include both directions for clarity during demo/debugging
-            parts.append(
-                f"{u}->{v}:res={float(res_fwd):.2f} / {v}->{u}:res={float(res_rev):.2f} (hop={hop_res:.2f})"
-            )
+            hop_res = min(res_fwd, res_rev)
+            parts.append(f"{u}->{v}:res={res_fwd:.2f} / {v}->{u}:res={res_rev:.2f} (hop={hop_res:.2f})")
 
         self.logger.info("%s: %s", prefix, " | ".join(parts))
