@@ -40,7 +40,7 @@ from throughput_slice import ThroughputSliceManager
 # -------------------------------------------------------------------
 # Feature flags (debug-friendly)
 # -------------------------------------------------------------------
-ENABLE_LATENCY_SLICE = False
+ENABLE_LATENCY_SLICE = True
 ENABLE_THROUGHPUT_SLICE = True
 
 

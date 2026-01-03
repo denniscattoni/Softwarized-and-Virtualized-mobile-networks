@@ -19,6 +19,39 @@ all:
 	@echo "*** Starting NFV slicing demo"
 	@sudo python3 emulation/run_demo.py
 
+
+# ----------------------------------------
+# Running RYU Manager controller
+# ----------------------------------------
+ryu:
+	@echo "Running RYU Manager controller"
+	@ryu-manager controller/slice_qos_app.py
+
+
+# ----------------------------------------
+# Executing C1 resource request
+# ----------------------------------------
+r:
+	@echo "*** Executing C1 resource request"
+	@python3 app/client_http_range_null.py --url http://10.0.0.100:8080/video.bin --chunk-bytes 1048576 --timeout 2 --retries 200 --backoff 0.3
+
+
+# ----------------------------------------
+# Running manual migration of srv2
+# ----------------------------------------
+1:
+	@echo "*** Manual migration of srv2 towards srv1:"
+	@curl -X POST "http://127.0.0.1:9090/service/switch?to=srv1"
+
+
+# ----------------------------------------
+# Running manual migration of srv1
+# ----------------------------------------
+2:
+	@echo "*** Manual migration of srv1 towards srv2:"
+	@curl -X POST "http://127.0.0.1:9090/service/switch?to=srv2"
+
+
 # ----------------------------------------
 # Cleanup
 # ----------------------------------------

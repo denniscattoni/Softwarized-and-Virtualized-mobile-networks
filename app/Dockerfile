@@ -3,9 +3,13 @@ LABEL authors="dennis"
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install nginx (VNF runtime)
+# Install runtime tools
 RUN apt-get update \
- && apt-get install -y --no-install-recommends nginx iproute2 net-tools \
+ && apt-get install -y --no-install-recommends \
+    nginx \
+    iproute2 \
+    net-tools \
+    iperf3 \
  && rm -rf /var/lib/apt/lists/*
 
 # Copy replicated content (edge cache)

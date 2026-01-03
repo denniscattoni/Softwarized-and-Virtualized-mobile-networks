@@ -29,8 +29,6 @@ SLICES = {
         "ingress_switch": 3,
         "egress_switch": 4,
 
-        #"ingress_host_port": 3,  # s3-eth3 -> c2
-        #"egress_host_port": 3,   # s4-eth3 -> srv1
         "ingress_host_port": 1,  # s3-eth1 -> c2
         "egress_host_port": 1,   # s4-eth1 -> srv1
 

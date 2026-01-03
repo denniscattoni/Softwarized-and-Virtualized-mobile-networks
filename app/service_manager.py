@@ -95,23 +95,6 @@ class ServiceManager:
         # Stop any previous nginx for determinism
         self._stop_nginx(host)
 
-        # Write a minimal config that serves the payload on :8080
-        # NOTE:
-        # - We overwrite a dedicated file to avoid depending on distro defaults.
-        host.cmd("mkdir -p /etc/nginx/conf.d")
-        host.cmd(
-            f"cat > {self.nginx_conf} <<'EOF'\n"
-            "server {\n"
-            f"    listen {self.port};\n"
-            "    server_name _;\n"
-            f"    root {self.content_dir};\n"
-            "    location / {\n"
-            "        autoindex on;\n"
-            "    }\n"
-            "}\n"
-            "EOF\n"
-        )
-
         # Start nginx (daemon mode)
         host.cmd("nginx >/dev/null 2>&1 &")
 
