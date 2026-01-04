@@ -98,7 +98,7 @@ def run():
     svc_mgr = ServiceManager(
         srv1,
         srv2,
-        port=8080,
+        port=8443,
         content_dir="/var/www/html",
         resource="video.bin",
     )

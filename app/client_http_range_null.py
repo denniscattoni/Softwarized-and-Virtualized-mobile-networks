@@ -8,9 +8,16 @@ Design goals:
 - User-level semantics: download a single URL (e.g., /video.bin).
 - Implementation: chunked Range GETs with retries (migration-friendly).
 - Discard payload: do not write to disk, measure throughput.
+
+Transport goals (Python 3.8 stdlib):
+- HTTPS with certificate verification (no -k / no insecure bypass).
+- TLS 1.3 required (fail if negotiated TLS is not 1.3).
+- NOTE: HTTP/2 cannot be guaranteed with urllib in Python 3.8 (stdlib is HTTP/1.1).
 """
 
 import argparse
+import socket
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -25,31 +32,61 @@ def ts():
     return time.strftime("%H:%M:%S") + f".{int(time.time() * 1000) % 1000:03d}"
 
 
-def http_head(url: str, timeout_s: float):
+def build_ssl_context_tls13(cafile: str) -> ssl.SSLContext:
+    """
+    Build an SSL context that:
+    - verifies server certificates (no insecure mode),
+    - trusts the provided cafile (self-signed cert or CA bundle),
+    - requires TLS 1.3.
+
+    NOTE:
+    - If you use a DIRECT self-signed server certificate, cafile can be server.crt.
+    - If you use a local CA that signs the server cert, cafile must be ca.crt.
+    """
+    if not cafile:
+        raise RuntimeError("Missing cafile for TLS verification (self-signed requires explicit trust anchor).")
+
+    #ctx = ssl.create_default_context(cafile=cafile)
+    ctx = ssl.create_default_context(cafile="app/certs/server.crt")
+
+    # Require TLS 1.3
+    try:
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    except Exception as e:
+        raise RuntimeError(f"TLS 1.3 enforcement not supported by this runtime: {e}") from e
+
+    # Enforce verification (default for create_default_context, but keep explicit)
+    ctx.check_hostname = True
+    ctx.verify_mode = ssl.CERT_REQUIRED
+
+    return ctx
+
+
+def http_head(url: str, timeout_s: float, ssl_ctx: ssl.SSLContext):
     """
     Perform a HEAD request to discover resource size and range support.
 
     :return (size_bytes, accept_ranges)
     """
     req = urllib.request.Request(url, method="HEAD")
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+    with urllib.request.urlopen(req, timeout=timeout_s, context=ssl_ctx) as resp:
         headers = resp.headers
         length = headers.get("Content-Length")
         accept_ranges = headers.get("Accept-Ranges", "")
         return int(length) if length is not None else None, accept_ranges.lower()
 
 
-def http_get_range_discard(url: str, start: int, end: int, timeout_s: float) -> int:
+def http_get_range_discard(url: str, start: int, end: int, timeout_s: float, ssl_ctx: ssl.SSLContext) -> int:
     """
     GET a byte range and discard the body.
 
     :return (int): number of bytes read
     """
     req = urllib.request.Request(url, method="GET")
-    req.add_header("Range", f"bytes={start}-{end}")
+    req.add_header("Range", "bytes={}-{}".format(start, end))
 
     total = 0
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+    with urllib.request.urlopen(req, timeout=timeout_s, context=ssl_ctx) as resp:
         # Read in small blocks to avoid buffering the whole chunk.
         while True:
             block = resp.read(64 * 1024)  # 64 KiB
@@ -68,18 +105,31 @@ def run(url: str, chunk_size: int, timeout_s: float, max_retries: int, backoff_s
     - A log line is printed at the end of each successfully completed chunk.
     - Retries are performed on the same chunk range if an error occurs.
     """
-    size, accept_ranges = http_head(url, timeout_s=timeout_s)
+    if not url.startswith("https://"):
+        raise RuntimeError("This client requires HTTPS. Use an https:// URL.")
+
+    # Trust anchor for the demo.
+    # Keep the same CLI args and workflow: no extra parameters.
+    #
+    # Choose ONE of the following depending on your cert generation:
+    # - Direct self-signed server cert: "app/certs/server.crt"
+    # - Local CA signing server cert:  "app/certs/ca.crt"
+    cafile = "app/certs/server.crt"
+
+    ssl_ctx = build_ssl_context_tls13(cafile=cafile)
+
+    size, accept_ranges = http_head(url, timeout_s=timeout_s, ssl_ctx=ssl_ctx)
     if size is None:
         raise RuntimeError("Server did not provide Content-Length; cannot chunk safely.")
 
     if "bytes" not in accept_ranges:
         raise RuntimeError("Server does not advertise Accept-Ranges: bytes.")
 
-    print(f"[{ts()}] [client] URL: {url}", flush=True)
-    print(f"[{ts()}] [client] Content-Length: {size} bytes", flush=True)
-    print(f"[{ts()}] [client] Chunk size: {chunk_size} bytes", flush=True)
+    print("[{}] [client] URL: {}".format(ts(), url), flush=True)
+    print("[{}] [client] Content-Length: {} bytes".format(ts(), size), flush=True)
+    print("[{}] [client] Chunk size: {} bytes".format(ts(), chunk_size), flush=True)
     print(
-        f"[{ts()}] [client] Timeout: {timeout_s}s  Retries/chunk: {max_retries}\n",
+        "[{}] [client] Timeout: {}s  Retries/chunk: {}\n".format(ts(), timeout_s, max_retries),
         flush=True,
     )
 
@@ -95,12 +145,12 @@ def run(url: str, chunk_size: int, timeout_s: float, max_retries: int, backoff_s
         attempt = 0
         while True:
             try:
-                got = http_get_range_discard(url, start, end, timeout_s=timeout_s)
+                got = http_get_range_discard(url, start, end, timeout_s=timeout_s, ssl_ctx=ssl_ctx)
 
                 # If we got a short read, treat as transient failure.
                 if got != expected:
                     raise RuntimeError(
-                        f"Short read: got={got} expected={expected} range={start}-{end}"
+                        "Short read: got={} expected={} range={}-{}".format(got, expected, start, end)
                     )
 
                 downloaded += got
@@ -112,25 +162,27 @@ def run(url: str, chunk_size: int, timeout_s: float, max_retries: int, backoff_s
 
                 # Log at the end of every successfully completed chunk.
                 print(
-                    f"[{ts()}] [client] Chunk {chunk_no} OK "
-                    f"range={start}-{end} bytes={got} "
-                    f"total={downloaded}/{size} ({mib:.2f} MiB) avg={mbps:.2f} Mbps",
+                    "[{}] [client] Chunk {} OK range={}-{} bytes={} total={}/{} ({:.2f} MiB) avg={:.2f} Mbps".format(
+                        ts(), chunk_no, start, end, got, downloaded, size, mib, mbps
+                    ),
                     flush=True,
                 )
                 break
 
-            except (urllib.error.URLError, urllib.error.HTTPError, RuntimeError) as e:
+            except (urllib.error.URLError, urllib.error.HTTPError, RuntimeError, socket.timeout, ssl.SSLError) as e:
                 attempt += 1
                 if attempt > max_retries:
                     raise RuntimeError(
-                        f"Failed range {start}-{end} after {max_retries} retries: {e}"
+                        "Failed range {}-{} after {} retries: {}".format(start, end, max_retries, e)
                     ) from e
                 time.sleep(backoff_s)
 
     total_t = time.time() - t0
     mbps = (downloaded * 8) / (total_t * 1_000_000) if total_t > 0 else 0.0
     print(
-        f"\n[{ts()}] [client] Done. Chunks: {chunk_no}  Total time: {total_t:.2f}s  Avg: {mbps:.2f} Mbps",
+        "\n[{}] [client] Done. Chunks: {}  Total time: {:.2f}s  Avg: {:.2f} Mbps".format(
+            ts(), chunk_no, total_t, mbps
+        ),
         flush=True,
     )
 

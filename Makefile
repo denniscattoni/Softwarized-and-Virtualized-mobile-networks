@@ -13,8 +13,19 @@ all:
 		dd if=/dev/urandom of=$(VIDEO) bs=1M count=20 status=none; \
 	fi
 
+	@echo "*** Preparing certificates"
+	@cd app/certs && \
+	FILES=$$(ls -A) && \
+	if [ "$$FILES" = "gen_certs.sh" ]; then \
+		./gen_certs.sh; \
+	else \
+		find . -mindepth 1 ! -name gen_certs.sh -exec rm -rf {} +; \
+		./gen_certs.sh; \
+	fi
+
 	@echo "*** Building Docker image $(IMAGE)"
-	@sudo docker build -t $(IMAGE) app/
+	@sudo docker build --no-cache --pull -t $(IMAGE) app/
+	@sudo docker image prune -f
 
 	@echo "*** Starting NFV slicing demo"
 	@sudo python3 emulation/run_demo.py
@@ -33,7 +44,7 @@ ryu:
 # ----------------------------------------
 r:
 	@echo "*** Executing C1 resource request"
-	@python3 app/client_http_range_null.py --url http://10.0.0.100:8080/video.bin --chunk-bytes 1048576 --timeout 2 --retries 200 --backoff 0.3
+	@python3 app/client_http_range_null.py --url https://10.0.0.100:8443/video.bin --chunk-bytes 1048576 --timeout 2 --retries 200 --backoff 0.3
 
 
 # ----------------------------------------

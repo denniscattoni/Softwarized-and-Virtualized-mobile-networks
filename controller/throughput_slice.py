@@ -210,7 +210,7 @@ class ThroughputSliceManager:
         """
         Install bidirectional slice rules with VIP NAT:
 
-          FORWARD:  c1 -> VIP:8080  (DNAT VIP->backend on backend edge switch)
+          FORWARD:  c1 -> VIP:8443  (DNAT VIP->backend on backend edge switch)
           REVERSE:  backend -> c1   (SNAT backend->VIP on ingress edge switch)
 
         IMPORTANT:

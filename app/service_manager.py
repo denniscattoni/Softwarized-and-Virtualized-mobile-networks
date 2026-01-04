@@ -3,8 +3,8 @@
 ServiceManager REST API (management plane) for NFV service migration.
 
 Goal:
-- Start/stop a minimal HTTP streaming service on srv1/srv2 (DockerHost nodes).
-- Keep dataplane (VIP/NAT + routing) fully controlled by the SDN controller.
+- Start/stop a minimal HTTPS streaming service on srv1/srv2 (DockerHost nodes).
+- Keep dataplane (VIP/VMAC + SDN NAT + routing) fully controlled by the SDN controller.
 
 API:
   GET  /service/status
@@ -13,7 +13,7 @@ API:
   POST /service/switch?to=srv1|srv2
 
 Design goals:
-- Debug-friendly: explicit shell commands, consistent logging.
+- Debug-friendly: explicit shell commands, consistent behavior.
 - Deterministic: stop kills any previous instance before starting.
 - Minimal dependencies: Python standard library only.
 
@@ -22,12 +22,18 @@ Content policy (build-time):
       COPY content/video.bin /var/www/html/video.bin
 - The Makefile ensures app/content/video.bin exists before building the image.
 - Therefore, at runtime we DO NOT generate payload; we hard-fail if it's missing.
+
+NGINX policy (build-time):
+- NGINX configuration is baked into the container image as a static file (e.g. /etc/nginx/conf.d/streaming.conf).
+- TLS certificates/keys are baked into the image (e.g. /etc/nginx/certs/server.{crt,key}).
+- Therefore, at runtime we DO NOT generate nginx config or certificates; this manager only starts/stops nginx.
 """
 
 from __future__ import annotations
 
 import os
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -47,18 +53,19 @@ class ServiceManager:
         srv1,
         srv2,
         *,
-        port: int = 8080,
+        port: int = 8443,
         content_dir: str = "/var/www/html",
         resource: str = "video.bin",
-        nginx_conf: str = "/etc/nginx/conf.d/streaming_demo.conf",
     ):
         self.srv1 = srv1
         self.srv2 = srv2
 
+        # Expected NGINX listen port (for sanity checks / debugging).
+        # The effective port is controlled by the baked NGINX configuration in the image.
         self.port = int(port)
+
         self.content_dir = str(content_dir)
         self.resource = str(resource)
-        self.nginx_conf = str(nginx_conf)
 
         # Runtime flags for observability (do not infer from process list)
         self.running = {"srv1": False, "srv2": False}
@@ -75,8 +82,8 @@ class ServiceManager:
 
         Determinism:
           - Always stop any previous nginx processes first.
-          - Always write a known config file.
           - Hard-fail if content payload is missing (must be in image).
+          - NGINX config/certs are baked into the image (static)
         """
         assert backend in ("srv1", "srv2"), f"ServiceManager: invalid backend={backend}"
         host = self.srv1 if backend == "srv1" else self.srv2
@@ -95,8 +102,13 @@ class ServiceManager:
         # Stop any previous nginx for determinism
         self._stop_nginx(host)
 
-        # Start nginx (daemon mode)
-        host.cmd("nginx >/dev/null 2>&1 &")
+        # Start nginx (daemon mode).
+        # NGINX on Ubuntu typically daemonizes by default; keep command minimal.
+        host.cmd("nginx >/dev/null 2>&1 || true")
+
+        # Sanity check: nginx should be listening on the expected port.
+        # Minimal fix: small retry loop to avoid startup race (common in containers).
+        self._assert_listening(host, self.port, backend)
 
         self.running[backend] = True
 
@@ -142,10 +154,39 @@ class ServiceManager:
         Best-effort nginx stop.
 
         We avoid systemctl here because DockerHost containers typically run without systemd.
+        Prefer nginx native stop; fallback to pkill patterns.
         """
+        host.cmd("nginx -s stop >/dev/null 2>&1 || true")
         host.cmd("pkill -f 'nginx: master' >/dev/null 2>&1 || true")
         host.cmd("pkill -f 'nginx: worker' >/dev/null 2>&1 || true")
         host.cmd("pkill -f '^nginx$' >/dev/null 2>&1 || true")
+
+    def _assert_listening(self, host, port: int, backend: str):
+        """
+        Assert nginx is listening on the expected TCP port.
+
+        This improves debuggability when changing the baked NGINX configuration
+        (e.g., migrating from 8080 -> 8443 for HTTPS).
+        """
+        port = int(port)
+
+        # Prefer ss; fallback to netstat (both are commonly available in the image).
+        # Minimal fix: retry a few times to avoid a startup race.
+        for _ in range(20):
+            rc = host.cmd(f"ss -lntp 2>/dev/null | grep -q ':{port} ' ; echo $?").strip()
+            if rc.endswith("0"):
+                return
+
+            rc = host.cmd(f"netstat -lntp 2>/dev/null | grep -q ':{port} ' ; echo $?").strip()
+            if rc.endswith("0"):
+                return
+
+            time.sleep(0.1)
+
+        assert False, (
+            f"ServiceManager: nginx started on {backend} but is NOT listening on port {port}. "
+            f"Check baked nginx config in /etc/nginx/conf.d/ and TLS cert/key paths."
+        )
 
 
 # -------------------------------------------------------------------

@@ -45,7 +45,7 @@ SLICES = {
             "ipv4_src": "10.0.0.1",      # c1
             "ipv4_dst": "10.0.0.100",    # VIP
             "ip_proto": 6,               # TCP
-            "tcp_dst": 8080,             # HTTP on 8080
+            "tcp_dst": 8443,             # HTTP on 8443
         },
 
         "objective": "max_throughput",
@@ -67,7 +67,7 @@ SLICES = {
             "name": "srv2",
             "ip": "10.0.0.4",
             "mac": "00:00:00:00:00:04",
-            "tcp_port": 8080,
+            "tcp_port": 8443,
             "egress_switch": 5,             # s5 is attached to srv2
             "egress_host_port": 1,          # s5-eth1 -> srv2 (host-facing)
         },
@@ -77,7 +77,7 @@ SLICES = {
             "name": "srv1",
             "ip": "10.0.0.3",
             "mac": "00:00:00:00:00:03",
-            "tcp_port": 8080,
+            "tcp_port": 8443,
             "egress_switch": 4,             # s4 is attached to srv1
             "egress_host_port": 1,          # s4-eth1 -> srv1 (host-facing)
         },

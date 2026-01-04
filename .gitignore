@@ -24,6 +24,12 @@ app/content
 *.bin
 
 # =========================
+# Certs
+# =========================
+app/certs/*
+!app/certs/gen_certs.sh
+
+# =========================
 # Temporary files / OS
 # =========================
 .DS_Store
