@@ -44,7 +44,7 @@ ryu:
 # ----------------------------------------
 r:
 	@echo "*** Executing C1 resource request"
-	@python3 app/client_http_range_null.py --url https://10.0.0.100:8443/video.bin --chunk-bytes 1048576 --timeout 2 --retries 200 --backoff 0.3
+	@python3 app/client_https_chunks.py --url https://10.0.0.100:8443/video.bin --chunk-bytes 1048576 --timeout 2 --retries 200 --backoff 0.3
 
 
 # ----------------------------------------
@@ -71,3 +71,8 @@ clean:
 	@sudo mn -c >/dev/null 2>&1 || true
 	@sudo docker rm -f srv1 srv2 >/dev/null 2>&1 || true
 	@rm -f $(VIDEO)
+	@cd app/certs && \
+	FILES=$$(ls -A) && \
+	if [ "$$FILES" != "gen_certs.sh" ]; then \
+		find . -mindepth 1 ! -name gen_certs.sh -exec rm -rf {} +; \
+	fi

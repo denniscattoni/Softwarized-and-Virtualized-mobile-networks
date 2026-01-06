@@ -1,7 +1,8 @@
+#!/usr/bin/env python3
 # controller/slice_qos_app.py
 
 """
-SliceQosApp Orchestrator (Architecture 2)
+SliceQosApp Orchestrator
 
 This is the ONLY RyuApp loaded by ryu-manager.
 
@@ -15,12 +16,21 @@ Design goals:
 - Keep behavior of the existing low-latency slice unchanged.
 - Add a high-throughput slice with widest-path routing and VIP NAT, without interfering
   with the low-latency slice.
+
+Monitoring policy (Architecture 2):
+- Do NOT use LLDP / topology discovery.
+- Topology is known a priori from LINK_PARAMS.
+- PortStats polling implements a Dual-Tier Polling Scheduler:
+    * Tier A (active): poll switches on the CURRENT active path(s) every cycle (priority).
+    * Tier B (background): poll a small number of non-active switches in round-robin
+      to avoid "frozen" EWMA metrics on links outside the active path(s).
 """
 
 from __future__ import annotations
 
 import time
 import logging
+from typing import List
 
 from ryu.base import app_manager
 from ryu.controller import ofp_event
@@ -40,7 +50,7 @@ from throughput_slice import ThroughputSliceManager
 # -------------------------------------------------------------------
 # Feature flags
 # -------------------------------------------------------------------
-ENABLE_LATENCY_SLICE = False
+ENABLE_LATENCY_SLICE = True
 ENABLE_THROUGHPUT_SLICE = True
 
 
@@ -88,6 +98,14 @@ class SliceQosApp(app_manager.RyuApp):
 
         # Build the logical graph immediately (static topology)
         self._init_logical_graph_from_config()
+
+        # ------------------------------------------------------------------
+        # Dual-Tier Polling Scheduler state (single-thread)
+        # ------------------------------------------------------------------
+        # Background RR list is recomputed deterministically from expected_switches \ active_set.
+        # We keep an index for round-robin selection across monitor cycles.
+        self._bg_rr_list: List[int] = []
+        self._bg_rr_idx: int = 0
 
         # ------------------------------------------------------------------
         # Slice managers (CREATE THEM BEFORE STARTING ANY THREADS)
@@ -307,15 +325,23 @@ class SliceQosApp(app_manager.RyuApp):
     # ------------------------------------------------------------------
     def _monitor(self):
         """
-        Semi-passive monitoring (Architecture 2):
+        Semi-passive monitoring (Architecture 2) with Dual-Tier Polling Monitor:
 
           - Poll PortStats every MONITOR_INTERVAL_S.
-          - Poll ONLY switches on active paths (latency + throughput), to reduce overhead.
+          - Tier A (active, priority): poll ONLY switches on active paths (latency + throughput),
+            to keep control-plane overhead bounded while keeping QoS enforcement reactive.
+          - Tier B (background, RR): additionally poll a small number of non-active switches
+            in round-robin to prevent "frozen" EWMA used_mbps metrics outside the active path(s).
           - After stats updates, evaluate QoS:
               * latency slice: cost-based QoS
               * throughput slice: bottleneck residual QoS
         """
         MONITOR_INTERVAL_S = 10
+
+        # Dual-Tier budget:
+        # - Tier A: poll all dpids on active path(s) every cycle (priority).
+        # - Tier B: poll K background dpids per cycle using round-robin.
+        BACKGROUND_POLL_PER_TICK = 2
 
         while True:
             self._bootstrap_if_ready()
@@ -327,22 +353,57 @@ class SliceQosApp(app_manager.RyuApp):
             lat_path = self.slices.get("latency", {}).get("current_path") if ENABLE_LATENCY_SLICE else None
             thr_path = self.slices.get("throughput", {}).get("current_path") if ENABLE_THROUGHPUT_SLICE else None
 
-            dpids_to_poll = []
+            # ---------------- Tier A (active path polling) ----------------
+            active_dpids = []
             if lat_path:
-                dpids_to_poll.extend(lat_path)
+                active_dpids.extend(lat_path)
             if thr_path:
-                dpids_to_poll.extend(thr_path)
+                active_dpids.extend(thr_path)
 
             # Remove duplicates preserving order
-            dpids_to_poll = list(dict.fromkeys(dpids_to_poll))
+            active_dpids = list(dict.fromkeys(active_dpids))
+            active_set = set(active_dpids)
 
-            if dpids_to_poll:
-                for dpid in dpids_to_poll:
+            # Poll Tier A first (priority)
+            for dpid in active_dpids:
+                dp = self.datapaths.get(dpid)
+                if dp is not None:
+                    self._request_port_stats(dp)
+
+            # ---------------- Tier B (background RR polling) ----------------
+            # Background is defined from expected_switches (static topology model) minus active_set.
+            # Deterministic RR list: sorted for stable behavior across runs.
+            bg_list = sorted(self.expected_switches - active_set)
+
+            # Update RR list if membership changed
+            if bg_list != self._bg_rr_list:
+                self._bg_rr_list = bg_list
+                if self._bg_rr_list:
+                    self._bg_rr_idx = self._bg_rr_idx % len(self._bg_rr_list)
+                else:
+                    self._bg_rr_idx = 0
+
+            # Poll a small number of background switches each tick.
+            # Important: advance RR index ONLY when we actually send a poll request.
+            sent_bg = 0
+            if self._bg_rr_list and BACKGROUND_POLL_PER_TICK > 0:
+                guard = 0
+                while sent_bg < BACKGROUND_POLL_PER_TICK and guard < len(self._bg_rr_list):
+                    dpid = self._bg_rr_list[self._bg_rr_idx]
                     dp = self.datapaths.get(dpid)
+
                     if dp is not None:
                         self._request_port_stats(dp)
+                        sent_bg += 1
+                        # advance only when a poll is sent
+                        self._bg_rr_idx = (self._bg_rr_idx + 1) % len(self._bg_rr_list)
+                    else:
+                        # if not connected, do not "consume" the slot; just try next candidate
+                        self._bg_rr_idx = (self._bg_rr_idx + 1) % len(self._bg_rr_list)
 
-            # QoS checks (managers)
+                    guard += 1
+
+            # ---------------- QoS checks (managers) ----------------
             if ENABLE_LATENCY_SLICE and self.latency_mgr is not None:
                 self.latency_mgr.check_qos()
 
