@@ -104,14 +104,8 @@ class LatencySliceManager:
             # Enter an explicit DISCONNECTED state and remove flows to avoid stale forwarding.
             if self.slice_conf.get("current_path") is not None:
                 self.logger.warning(
-                    "Latency slice DISCONNECTED: no path from %s to %s. Clearing current_path and deleting slice flows. "
-                    "[reason=%s]",
-                    ingress, egress, reason,
-                )
-            else:
-                self.logger.warning(
-                    "Latency slice still DISCONNECTED: no path from %s to %s. [reason=%s]",
-                    ingress, egress, reason,
+                    "SLICE=latency EV=DISCONNECTED reason=%s ingress=%s egress=%s",
+                    reason, ingress, egress
                 )
 
             self.slice_conf["current_path"] = None
@@ -126,14 +120,13 @@ class LatencySliceManager:
 
         if total_cost <= max_delay:
             self.logger.info(
-                "Installing latency path %s (cost=%.1f ms <= %.1f ms) [reason=%s]",
-                path, total_cost, max_delay, reason,
+                "SLICE=latency EV=PATH_INSTALL reason=%s path=%s cost_ms=%.1f max_ms=%.1f qos=OK",
+                reason, path, total_cost, max_delay
             )
         else:
             self.logger.warning(
-                "Latency slice QoS NOT satisfied: best path %s has cost=%.1f ms > %.1f ms. "
-                "Installing best available path anyway. [reason=%s]",
-                path, total_cost, max_delay, reason,
+                "SLICE=latency EV=PATH_INSTALL reason=%s path=%s cost_ms=%.1f max_ms=%.1f qos=UNSAT",
+                reason, path, total_cost, max_delay
             )
 
         self.delete_flows()
@@ -156,16 +149,17 @@ class LatencySliceManager:
             return
 
         self.logger.warning(
-            "Latency slice QoS VIOLATION on current path %s (cost=%.1f ms > %.1f ms). Recomputing.",
-            path, total_cost, max_delay,
+            "SLICE=latency EV=QOS_VIOLATION reason=qos_violation path=%s cost_ms=%.1f max_ms=%.1f",
+            path, total_cost, max_delay
         )
+
         self.recompute_path(reason="qos_violation")
 
     def on_path_affected(self, reason: str = "path_affected"):
         """
         Called by the orchestrator when it detects that a link-down event affects the current path.
         """
-        self.logger.warning("Current latency path affected. Recomputing. [reason=%s]", reason)
+        self.logger.warning("SLICE=latency EV=PATH_AFFECTED reason=%s action=RECOMPUTE", reason)
         self.recompute_path(reason=reason)
 
     def delete_flows(self):
@@ -229,7 +223,7 @@ class LatencySliceManager:
             next_dpid = path[idx + 1]
             out_port = self.next_hop_port.get((dpid, next_dpid))
             if out_port is None:
-                self.logger.warning("No NEXT_HOP_PORT mapping for %s -> %s", dpid, next_dpid)
+                self.logger.warning("SLICE=latency EV=NO_PORT_MAP direction=fwd u=%s v=%s", dpid, next_dpid)
                 continue
 
             actions = build_actions_for_slice(parser, int(out_port), self.slice_conf)
@@ -273,7 +267,7 @@ class LatencySliceManager:
             next_dpid = rev_path[idx + 1]
             out_port = self.next_hop_port.get((dpid, next_dpid))
             if out_port is None:
-                self.logger.warning("No NEXT_HOP_PORT mapping for %s -> %s (reverse)", dpid, next_dpid)
+                self.logger.warning("SLICE=latency EV=NO_PORT_MAP direction=fwd u=%s v=%s", dpid, next_dpid)
                 continue
 
             actions = build_actions_for_slice(parser, int(out_port), self.slice_conf)

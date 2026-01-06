@@ -50,7 +50,7 @@ from throughput_slice import ThroughputSliceManager
 # -------------------------------------------------------------------
 # Feature flags
 # -------------------------------------------------------------------
-ENABLE_LATENCY_SLICE = True
+ENABLE_LATENCY_SLICE = False
 ENABLE_THROUGHPUT_SLICE = True
 
 
@@ -108,6 +108,21 @@ class SliceQosApp(app_manager.RyuApp):
         self._bg_rr_idx: int = 0
 
         # ------------------------------------------------------------------
+        # Structured logging / tick context (single-thread)
+        # ------------------------------------------------------------------
+        # Monotonic tick sequence number (for correlating async PortStats replies).
+        self._tick_seq: int = 0
+
+        # Last poll context per DPID (updated when a PortStatsRequest is SENT).
+        # dpid -> { "tick": int, "tier": "active"|"rr", "label": str }
+        # label is an operator-facing hint (e.g., "active_latency", "active_throughput", "rr").
+        self._poll_ctx_by_dpid = {}
+
+        # Snapshot of last-known active paths (for readable per-tick PATH_STATE).
+        self._last_lat_path = None
+        self._last_thr_path = None
+
+        # ------------------------------------------------------------------
         # Slice managers (CREATE THEM BEFORE STARTING ANY THREADS)
         # This avoids races where _monitor() runs before managers exist.
         # ------------------------------------------------------------------
@@ -142,19 +157,45 @@ class SliceQosApp(app_manager.RyuApp):
         self.monitor_thread = hub.spawn(self._monitor)
 
         self.logger.info(
-            "SliceQosApp orchestrator initialized (arch2). Expected switches: %s",
+            "SLICE=orchestrator EV=INIT expected_switches=%s",
             sorted(self.expected_switches),
         )
         self.logger.info(
-            "Enabled slices: latency=%s throughput=%s",
+            "SLICE=orchestrator EV=FEATURE_FLAGS latency=%s throughput=%s",
             bool(ENABLE_LATENCY_SLICE),
             bool(ENABLE_THROUGHPUT_SLICE),
         )
         self.logger.info(
-            "Flow priorities: latency=%s throughput=%s",
+            "SLICE=orchestrator EV=FLOW_PRIORITY latency=%s throughput=%s",
             int(SLICE_FLOW_PRIORITY_LATENCY),
             int(SLICE_FLOW_PRIORITY_THROUGHPUT),
         )
+
+    def _init_logical_graph_from_config(self):
+        for (u, v), params in LINK_PARAMS.items():
+            self.topo.add_link(u, v, delay_ms=params["delay_ms"], capacity_mbps=params["capacity_mbps"])
+
+    def _bootstrap_if_ready(self):
+        if self.bootstrap_done:
+            return
+        if not self.expected_switches:
+            self.bootstrap_done = True
+            return
+
+        have = set(self.datapaths.keys())
+        missing = self.expected_switches - have
+        if missing:
+            return
+
+        self.logger.info("SLICE=orchestrator EV=TOPO_READY expected_dpids=%s", sorted(self.expected_switches))
+
+        if ENABLE_LATENCY_SLICE and self.latency_mgr is not None:
+            self.latency_mgr.recompute_path(reason="bootstrap_all_switches_connected")
+
+        if ENABLE_THROUGHPUT_SLICE and self.throughput_mgr is not None:
+            self.throughput_mgr.recompute_path(reason="bootstrap_all_switches_connected")
+
+        self.bootstrap_done = True
 
     # ------------------------------------------------------------------
     # Bootstrap / expected topology
@@ -175,37 +216,10 @@ class SliceQosApp(app_manager.RyuApp):
             conf = self.slices.get("throughput")
             assert conf is not None, "Missing SLICES['throughput']"
             s.add(conf["ingress_switch"])
-            # We may target either remote or closest backend; require both edge switches.
             s.add(conf["remote_backend"]["egress_switch"])
             s.add(conf["closest_backend"]["egress_switch"])
 
         return s
-
-    def _init_logical_graph_from_config(self):
-        for (u, v), params in LINK_PARAMS.items():
-            self.topo.add_link(u, v, delay_ms=params["delay_ms"], capacity_mbps=params["capacity_mbps"])
-
-    def _bootstrap_if_ready(self):
-        if self.bootstrap_done:
-            return
-        if not self.expected_switches:
-            self.bootstrap_done = True
-            return
-
-        have = set(self.datapaths.keys())
-        missing = self.expected_switches - have
-        if missing:
-            return
-
-        self.logger.info("\nTopology READY (all expected datapaths registered). Running initial slice bootstrap.")
-
-        if ENABLE_LATENCY_SLICE and self.latency_mgr is not None:
-            self.latency_mgr.recompute_path(reason="bootstrap_all_switches_connected")
-
-        if ENABLE_THROUGHPUT_SLICE and self.throughput_mgr is not None:
-            self.throughput_mgr.recompute_path(reason="bootstrap_all_switches_connected")
-
-        self.bootstrap_done = True
 
     # ------------------------------------------------------------------
     # Datapath state tracking
@@ -218,12 +232,12 @@ class SliceQosApp(app_manager.RyuApp):
         if ev.state == MAIN_DISPATCHER:
             if dpid not in self.datapaths:
                 self.datapaths[dpid] = dp
-                self.logger.info("Register datapath: %s", dpid)
+                self.logger.info("SLICE=orchestrator EV=DP_REGISTER dpid=%s", dpid)
                 self._bootstrap_if_ready()
 
         elif ev.state == DEAD_DISPATCHER:
             if dpid in self.datapaths:
-                self.logger.warning("Unregister datapath: %s", dpid)
+                self.logger.warning("SLICE=orchestrator EV=DP_UNREGISTER dpid=%s", dpid)
                 del self.datapaths[dpid]
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
@@ -257,6 +271,9 @@ class SliceQosApp(app_manager.RyuApp):
         port_no = msg.desc.port_no
         ofproto = dp.ofproto
 
+        # Best-effort correlation: PortStatus is async, so we attach the latest tick seq.
+        seq = int(getattr(self, "_tick_seq", 0))
+
         # Map (dpid, port) -> neighbor switch (inter-switch ports only)
         nbr = PORT_TO_NEIGHBOR.get((dpid, port_no))
         if nbr is None:
@@ -283,7 +300,10 @@ class SliceQosApp(app_manager.RyuApp):
                 affected_latency = affected_latency or self._edge_in_path((nbr, dpid), lat_path)
                 affected_throughput = affected_throughput or self._edge_in_path((nbr, dpid), thr_path)
 
-            self.logger.warning("Link DOWN via port status: %s(port %s) <-> %s", dpid, port_no, nbr)
+            self.logger.warning(
+                "SLICE=orchestrator EV=LINK_DOWN seq=%s dpid=%s port=%s nbr=%s",
+                seq, dpid, port_no, nbr
+            )
 
             # Trigger recompute only if affected
             if ENABLE_LATENCY_SLICE and self.latency_mgr is not None and affected_latency:
@@ -302,17 +322,20 @@ class SliceQosApp(app_manager.RyuApp):
                 p = LINK_PARAMS[(nbr, dpid)]
                 self.topo.add_link(nbr, dpid, delay_ms=p["delay_ms"], capacity_mbps=p["capacity_mbps"])
 
-            self.logger.info("Link UP via port status: %s(port %s) <-> %s", dpid, port_no, nbr)
+            self.logger.info(
+                "SLICE=orchestrator EV=LINK_UP seq=%s dpid=%s port=%s nbr=%s",
+                seq, dpid, port_no, nbr
+            )
 
             # On link UP, recompute ONLY if slice is DISCONNECTED (current_path is None)
             if ENABLE_LATENCY_SLICE and self.latency_mgr is not None:
                 if self.slices.get("latency", {}).get("current_path") is None:
-                    self.logger.warning("Latency slice was DISCONNECTED. Recomputing on link-up recovery.")
+                    self.logger.warning("SLICE=latency EV=RECOVERY_TRIGGER seq=%s reason=link_up_recovery", seq)
                     self.latency_mgr.recompute_path(reason="link_up_recovery")
 
             if ENABLE_THROUGHPUT_SLICE and self.throughput_mgr is not None:
                 if self.slices.get("throughput", {}).get("current_path") is None:
-                    self.logger.warning("Throughput slice was DISCONNECTED. Recomputing on link-up recovery.")
+                    self.logger.warning("SLICE=throughput EV=RECOVERY_TRIGGER seq=%s reason=link_up_recovery", seq)
                     self.throughput_mgr.recompute_path(reason="link_up_recovery")
 
     def _edge_in_path(self, edge, path):
@@ -350,8 +373,35 @@ class SliceQosApp(app_manager.RyuApp):
                 hub.sleep(MONITOR_INTERVAL_S)
                 continue
 
+            self._tick_seq += 1
+            tick = self._tick_seq
+            now = time.time()
+
             lat_path = self.slices.get("latency", {}).get("current_path") if ENABLE_LATENCY_SLICE else None
             thr_path = self.slices.get("throughput", {}).get("current_path") if ENABLE_THROUGHPUT_SLICE else None
+
+            self._last_lat_path = lat_path
+            self._last_thr_path = thr_path
+
+            # ---------------- Tick header (operator-friendly) ----------------
+            self.logger.info("\nSLICE=orchestrator EV=TICK seq=%s ts=%.3f interval_s=%s", tick, now, MONITOR_INTERVAL_S)
+
+            # ---------------- Slice state summary (stable per tick) ----------------
+            if ENABLE_LATENCY_SLICE:
+                p = lat_path
+                state = "DISCONNECTED" if not p else "ACTIVE"
+                self.logger.info("SLICE=latency EV=PATH_STATE seq=%s state=%s path=%s", tick, state, p)
+
+            if ENABLE_THROUGHPUT_SLICE:
+                conf = self.slices.get("throughput", {})
+                p = thr_path
+                state = conf.get("state", "?")
+                backend = conf.get("active_backend", "?")
+                min_mbps = conf.get("min_throughput_mbps", "?")
+                self.logger.info(
+                    "SLICE=throughput EV=PATH_STATE seq=%s state=%s backend=%s min_mbps=%s path=%s",
+                    tick, state, backend, min_mbps, p
+                )
 
             # ---------------- Tier A (active path polling) ----------------
             active_dpids = []
@@ -364,15 +414,31 @@ class SliceQosApp(app_manager.RyuApp):
             active_dpids = list(dict.fromkeys(active_dpids))
             active_set = set(active_dpids)
 
-            # Poll Tier A first (priority)
+            if active_dpids:
+                self.logger.info("SLICE=orchestrator EV=POLL_ACTIVE seq=%s dpids=%s", tick, active_dpids)
+
+            # Poll Tier A first (priority). Label per dpid is chosen deterministically:
+            # if dpid appears on both paths, label as "active_both".
+            lat_set = set(lat_path) if lat_path else set()
+            thr_set = set(thr_path) if thr_path else set()
+
             for dpid in active_dpids:
                 dp = self.datapaths.get(dpid)
-                if dp is not None:
-                    self._request_port_stats(dp)
+                if dp is None:
+                    continue
+
+                if (dpid in lat_set) and (dpid in thr_set):
+                    label = "active_both"
+                elif dpid in lat_set:
+                    label = "active_latency"
+                elif dpid in thr_set:
+                    label = "active_throughput"
+                else:
+                    label = "active"
+
+                self._request_port_stats(dp, tier="active", label=label, tick_seq=tick)
 
             # ---------------- Tier B (background RR polling) ----------------
-            # Background is defined from expected_switches (static topology model) minus active_set.
-            # Deterministic RR list: sorted for stable behavior across runs.
             bg_list = sorted(self.expected_switches - active_set)
 
             # Update RR list if membership changed
@@ -383,25 +449,24 @@ class SliceQosApp(app_manager.RyuApp):
                 else:
                     self._bg_rr_idx = 0
 
-            # Poll a small number of background switches each tick.
-            # Important: advance RR index ONLY when we actually send a poll request.
-            sent_bg = 0
+            sent_bg = []
             if self._bg_rr_list and BACKGROUND_POLL_PER_TICK > 0:
                 guard = 0
-                while sent_bg < BACKGROUND_POLL_PER_TICK and guard < len(self._bg_rr_list):
+                while len(sent_bg) < BACKGROUND_POLL_PER_TICK and guard < len(self._bg_rr_list):
                     dpid = self._bg_rr_list[self._bg_rr_idx]
                     dp = self.datapaths.get(dpid)
 
+                    # advance index every attempt (but count "sent" only on actual send)
+                    self._bg_rr_idx = (self._bg_rr_idx + 1) % len(self._bg_rr_list)
+
                     if dp is not None:
-                        self._request_port_stats(dp)
-                        sent_bg += 1
-                        # advance only when a poll is sent
-                        self._bg_rr_idx = (self._bg_rr_idx + 1) % len(self._bg_rr_list)
-                    else:
-                        # if not connected, do not "consume" the slot; just try next candidate
-                        self._bg_rr_idx = (self._bg_rr_idx + 1) % len(self._bg_rr_list)
+                        self._request_port_stats(dp, tier="rr", label="rr", tick_seq=tick)
+                        sent_bg.append(dpid)
 
                     guard += 1
+
+            if sent_bg:
+                self.logger.info("SLICE=orchestrator EV=POLL_RR seq=%s dpids=%s", tick, sent_bg)
 
             # ---------------- QoS checks (managers) ----------------
             if ENABLE_LATENCY_SLICE and self.latency_mgr is not None:
@@ -412,7 +477,20 @@ class SliceQosApp(app_manager.RyuApp):
 
             hub.sleep(MONITOR_INTERVAL_S)
 
-    def _request_port_stats(self, datapath):
+    def _request_port_stats(self, datapath, *, tier: str, label: str, tick_seq: int):
+        """
+        Send a PortStats request and record poll context for later correlation
+        when the async PortStatsReply arrives.
+        """
+        dpid = datapath.id
+
+        # Record context for this DPID (used by _port_stats_reply_handler)
+        self._poll_ctx_by_dpid[dpid] = {
+            "tick": int(tick_seq),
+            "tier": str(tier),
+            "label": str(label),
+        }
+
         parser = datapath.ofproto_parser
         ofproto = datapath.ofproto
         req = parser.OFPPortStatsRequest(datapath, 0, ofproto.OFPP_ANY)
@@ -422,6 +500,11 @@ class SliceQosApp(app_manager.RyuApp):
     def _port_stats_reply_handler(self, ev):
         dpid = ev.msg.datapath.id
         now = time.time()
+
+        ctx = self._poll_ctx_by_dpid.get(dpid, None)
+        seq = ctx["tick"] if ctx else -1
+        tier = ctx["tier"] if ctx else "unknown"
+        label = ctx["label"] if ctx else "unknown"
 
         for stat in ev.msg.body:
             port_no = stat.port_no
@@ -433,8 +516,12 @@ class SliceQosApp(app_manager.RyuApp):
             if last is not None:
                 delta_tx = tx_bytes - last["tx_bytes"]
                 delta_t = now - last["time"]
+
                 if delta_tx < 0:
+                    # Counter wrapped/reset; skip this sample
+                    self.port_stats_state[key] = {"tx_bytes": tx_bytes, "time": now}
                     continue
+
                 if delta_t > 0:
                     used_mbps = (delta_tx * 8.0) / (delta_t * 1e6)
 
@@ -442,9 +529,17 @@ class SliceQosApp(app_manager.RyuApp):
                     if nbr is not None:
                         self.topo.update_link_usage(dpid, nbr, used_mbps)
                         m = self.topo.get_link_metrics(dpid, nbr)
-                        self.logger.info(
-                            "LINK %s->%s raw=%.3f ewma=%.3f cap=%.1f",
-                            dpid, nbr, m["used_mbps_raw"], m["used_mbps_ewma"], m["capacity_mbps"]
-                        )
+                        if m is None:
+                            self.logger.warning(
+                                "SLICE=orchestrator EV=LINK_METRICS_MISSING seq=%s tier=%s label=%s u=%s v=%s port=%s",
+                                seq, tier, label, dpid, nbr, port_no
+                            )
+                        else:
+                            self.logger.info(
+                                "SLICE=orchestrator EV=LINK seq=%s tier=%s label=%s u=%s v=%s port=%s "
+                                "raw=%.3f ewma=%.3f cap=%.1f",
+                                seq, tier, label, dpid, nbr, port_no,
+                                float(m["used_mbps_raw"]), float(m["used_mbps_ewma"]), float(m["capacity_mbps"])
+                            )
 
             self.port_stats_state[key] = {"tx_bytes": tx_bytes, "time": now}
