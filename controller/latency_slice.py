@@ -38,7 +38,7 @@ COOKIE_MASK_ALL = 0xFFFFFFFFFFFFFFFF
 
 class LatencySliceManager:
     """
-    Latency slice path management policy (Architecture 2):
+    Latency slice path management policy:
 
     - First time (bootstrap):
         * compute the best path using a cost function (delay + congestion penalty),

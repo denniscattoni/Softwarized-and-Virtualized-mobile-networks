@@ -2,17 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-About: HTTP "single resource" downloader using Range requests, discarding data (dev/null style).
+About: HTTPS "single resource" downloader using Range requests, discarding data (dev/null).
 
 Design goals:
 - User-level semantics: download a single URL (e.g., /video.bin).
 - Implementation: chunked Range GETs with retries (migration-friendly).
 - Discard payload: do not write to disk, measure throughput.
 
-Transport goals (Python 3.8 stdlib):
+Transport goals:
 - HTTPS with certificate verification (no -k / no insecure bypass).
 - TLS 1.3 required (fail if negotiated TLS is not 1.3).
-- NOTE: HTTP/2 cannot be guaranteed with urllib in Python 3.8 (stdlib is HTTP/1.1).
 """
 
 import argparse

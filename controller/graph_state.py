@@ -3,7 +3,7 @@
 """
 TopologyGraph: wrapper around NetworkX to store the SDN topology and per-link metrics.
 
-Architecture 2 notes:
+Architecture notes:
   - The topology is initialized from a static model (LINK_PARAMS) in the controller.
   - Link up/down is handled by the controller via OFPPortStatus by calling remove_link()/add_link().
   - This module:
@@ -11,7 +11,7 @@ Architecture 2 notes:
       * stores per-edge metrics (delay_ms, capacity_mbps, used_mbps),
       * provides shortest-path computation with a caller-provided weight function.
 
-Design choice (Architecture 2):
+Design choice:
   - We keep per-link metrics (link_info) even when a link goes DOWN.
     remove_link() removes only the edge from the graph, not its stored metrics.
     This preserves EWMA state across link flaps and avoids cold-start effects.

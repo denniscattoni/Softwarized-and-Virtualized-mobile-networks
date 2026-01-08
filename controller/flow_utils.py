@@ -3,7 +3,7 @@
 """
 Utility functions for building OpenFlow matches and installing/removing flows.
 
-Architecture 2:
+Architecture:
 - Topology is static (known a priori), but flow programming is unchanged.
 - We use cookies to delete ONLY the flows installed by the slicing app.
 

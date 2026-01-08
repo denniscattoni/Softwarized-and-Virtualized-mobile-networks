@@ -31,20 +31,43 @@ COOKIE_MASK_ALL = 0xFFFFFFFFFFFFFFFF
 
 class ThroughputSliceManager:
     """
-    Policy:
-      - Bootstrap: compute and install widest path toward active backend (default remote=srv2).
-      - Operational: recompute only when:
-          * QoS violation on current path, or
-          * link-down affects current path.
+    Step 1:
+      - Bootstrap:
+          * compute and install the widest path toward the active backend
+            (default: remote = srv2).
+      - Operational:
+          * recompute only when:
+              - QoS violation on the current path, or
+              - a link-down event affects the current path.
 
-    Recovery-safe:
-      - If no path exists: current_path=None, delete flows, state=DISCONNECTED.
-      - On link-up: orchestrator triggers recompute only if DISCONNECTED.
+    Step 2: Availability-first recovery policy:
+      - If NO path exists toward the active backend:
+          * if active backend is CLOSEST (srv1) and migration is enabled,
+            attempt a failback to REMOTE (srv2) before declaring DISCONNECTED;
+          * if active backend is REMOTE (srv2) and migration is enabled,
+            attempt a migration to CLOSEST (srv1);
+          * only if NO path exists toward ANY backend,
+            enter DISCONNECTED state (current_path=None, flows deleted).
 
-    Step 3 (migration):
-      - If active backend is REMOTE (srv2) and even the BEST possible path cannot satisfy QoS,
-        trigger REST switch to CLOSEST (srv1), then reinstall flows toward srv1 (VIP unchanged).
-      - No cooldown/streak: migration is immediate and one-way in this demo (no auto migrate back).
+      - If a path exists but QoS is NOT satisfied:
+          * the best available path is still installed (service remains reachable);
+          * migration is considered ONLY when REMOTE is active.
+
+      - On link-up:
+          * the orchestrator triggers a recompute ONLY if the slice is DISCONNECTED.
+
+    Step 3 (migration policy):
+      - QoS-driven migration:
+          * if active backend is REMOTE (srv2) and even the BEST possible path
+            cannot satisfy the minimum throughput constraint,
+            trigger a REST switch to CLOSEST (srv1).
+      - Connectivity-driven migration:
+          * if active backend is CLOSEST (srv1) and becomes unreachable,
+            trigger a REST failback to REMOTE (srv2) before declaring DISCONNECTED.
+
+      - No cooldown or hysteresis:
+          * migrations are immediate and purely event-driven
+            (QoS violation or loss of connectivity).
     """
 
     def __init__(
@@ -93,67 +116,148 @@ class ThroughputSliceManager:
             hop_residual(u,v) = min(residual(u,v), residual(v,u))
 
         If no path:
-          - if active is REMOTE and migration is enabled -> try migrate to CLOSEST and recompute
-          - else DISCONNECTED (clear flows)
+          - If active is REMOTE and migration is enabled -> try migrate to CLOSEST and recompute
+          - If active is CLOSEST and migration is enabled -> try FAILBACK to REMOTE and recompute
+          - If BOTH backends are unreachable -> DISCONNECTED (clear flows)
         """
-        backend = self._get_active_backend_conf()
         ingress = int(self.slice_conf["ingress_switch"])
-        egress = int(backend["egress_switch"])
         thr_min = float(self.slice_conf["min_throughput_mbps"])
 
-        path = self.topo.compute_widest_path_bidirectional(ingress, egress)
+        def _compute_for_backend(backend_conf):
+            egress = int(backend_conf["egress_switch"])
+            p = self.topo.compute_widest_path_bidirectional(ingress, egress)
+            if p is None:
+                return None, None
+            b = self.topo.estimate_path_bottleneck_bidirectional_mbps(p)
+            return p, b
 
-        # -------------------- NO PATH --------------------
+        # --- Attempt 1: current active backend ---
+        backend = self._get_active_backend_conf()
+        path, bottleneck = _compute_for_backend(backend)
+
+        # -------------------- NO PATH (attempt 1) --------------------
         if path is None:
-            action = "TRY_MIGRATE_CLOSEST" if (self._is_remote_active() and self._migration_enabled()) else "DISCONNECT"
+            # Decide recovery action:
+            # - If we are on CLOSEST (srv1) and it became unreachable, prefer service availability:
+            #     try failback to REMOTE (srv2) before declaring DISCONNECTED.
+            # - If we are on REMOTE (srv2) and it is unreachable, optionally try migrate to CLOSEST (srv1).
+            # IMPORTANT (anti-loop):
+            #   We will try AT MOST ONE switch of backend in this call.
+            if self._migration_enabled():
+                if not self._is_remote_active():
+                    action = "TRY_FAILBACK_REMOTE"
+                else:
+                    action = "TRY_MIGRATE_CLOSEST"
+            else:
+                action = "DISCONNECT"
+
+            egress = int(backend["egress_switch"])
             self.logger.warning(
                 "SLICE=throughput EV=NO_PATH reason=%s backend=%s ingress=%s egress=%s action=%s",
                 reason, backend.get("name", "?"), ingress, egress, action
             )
 
-            if action == "TRY_MIGRATE_CLOSEST":
+            # Case 1: active=CLOSEST (srv1) but disconnected -> failback to REMOTE (srv2) first
+            if action == "TRY_FAILBACK_REMOTE":
+                self.logger.warning("SLICE=throughput EV=FAILBACK_TRIGGER reason=%s target=remote", reason)
+                if self._migrate_to("remote", reason=f"no_path_to_closest:{reason}"):
+                    backend2 = self._get_active_backend_conf()
+                    path2, bottleneck2 = _compute_for_backend(backend2)
+                    if path2 is None:
+                        egress2 = int(backend2["egress_switch"])
+                        self.logger.warning(
+                            "SLICE=throughput EV=NO_PATH reason=%s backend=%s ingress=%s egress=%s action=DISCONNECT",
+                            "after_failback_no_path", backend2.get("name", "?"), ingress, egress2
+                        )
+                        self.logger.warning(
+                            "SLICE=throughput EV=DISCONNECTED reason=%s backend=%s ingress=%s egress=%s",
+                            "after_failback_no_path", backend2.get("name", "?"), ingress, egress2
+                        )
+                        self.slice_conf["current_path"] = None
+                        self.slice_conf["state"] = "DISCONNECTED"
+                        self.delete_flows()
+                        return
+
+                    backend = backend2
+                    path = path2
+                    bottleneck = bottleneck2
+                    reason = "after_failback_no_path"
+
+            # Case 2: active=REMOTE (srv2) but disconnected -> try migrate to CLOSEST
+            elif action == "TRY_MIGRATE_CLOSEST":
+                self.logger.warning("SLICE=throughput EV=MIGRATE_TRIGGER reason=%s target=closest", reason)
                 if self._migrate_to("closest", reason=f"no_path_to_remote:{reason}"):
-                    return self.recompute_path(reason="after_migration_no_path")
+                    backend2 = self._get_active_backend_conf()
+                    path2, bottleneck2 = _compute_for_backend(backend2)
+                    if path2 is None:
+                        egress2 = int(backend2["egress_switch"])
+                        self.logger.warning(
+                            "SLICE=throughput EV=NO_PATH reason=%s backend=%s ingress=%s egress=%s action=DISCONNECT",
+                            "after_migration_no_path", backend2.get("name", "?"), ingress, egress2
+                        )
+                        self.logger.warning(
+                            "SLICE=throughput EV=DISCONNECTED reason=%s backend=%s ingress=%s egress=%s",
+                            "after_migration_no_path", backend2.get("name", "?"), ingress, egress2
+                        )
+                        self.slice_conf["current_path"] = None
+                        self.slice_conf["state"] = "DISCONNECTED"
+                        self.delete_flows()
+                        return
 
-            self.logger.warning(
-                "SLICE=throughput EV=DISCONNECTED reason=%s backend=%s ingress=%s egress=%s",
-                reason, backend.get("name", "?"), ingress, egress
-            )
-            self.slice_conf["current_path"] = None
-            self.slice_conf["state"] = "DISCONNECTED"
-            self.delete_flows()
-            return
+                    backend = backend2
+                    path = path2
+                    bottleneck = bottleneck2
+                    reason = "after_migration_no_path"
 
-        bottleneck = self.topo.estimate_path_bottleneck_bidirectional_mbps(path)
+            # No recovery possible (or migration disabled) -> DISCONNECTED
+            else:
+                self.logger.warning(
+                    "SLICE=throughput EV=DISCONNECTED reason=%s backend=%s ingress=%s egress=%s",
+                    reason, backend.get("name", "?"), ingress, int(backend["egress_switch"])
+                )
+                self.slice_conf["current_path"] = None
+                self.slice_conf["state"] = "DISCONNECTED"
+                self.delete_flows()
+                return
 
+        # -------------------- PATH FOUND --------------------
         self.logger.info(
             "SLICE=throughput EV=PATH_SELECT reason=%s path=%s bottleneck_mbps=%.2f min_mbps=%.2f backend=%s state=%s",
-            reason, path, bottleneck, thr_min, backend.get("name", "?"), self.slice_conf.get("state", "?")
+            reason, path, float(bottleneck), thr_min, backend.get("name", "?"), self.slice_conf.get("state", "?")
         )
 
         # -------------------- BEST PATH STILL UNSATISFIED --------------------
-        if bottleneck < thr_min:
+        if float(bottleneck) < thr_min:
             self.logger.warning(
                 "SLICE=throughput EV=QOS_UNSAT_BEST reason=%s backend=%s path=%s bottleneck_mbps=%.2f min_mbps=%.2f",
-                reason, backend.get("name", "?"), path, bottleneck, thr_min
+                reason, backend.get("name", "?"), path, float(bottleneck), thr_min
             )
-
             self._log_path_residuals(path, prefix="SLICE=throughput EV=PATH_RESIDUALS")
 
-            # Immediate migration trigger only when REMOTE is active
+            # Immediate migration trigger only when REMOTE is active.
+            # IMPORTANT (anti-oscillation):
+            #   migrate to CLOSEST only if CLOSEST is REACHABLE (path exists).
             if self._is_remote_active() and self._migration_enabled():
-                self.logger.warning("SLICE=throughput EV=MIGRATE_TRIGGER reason=%s target=closest", reason)
-                if self._migrate_to("closest", reason=f"qos_unsatisfied_best_path:{reason}"):
-                    return self.recompute_path(reason="after_migration_qos_unsatisfied")
+                closest_conf = self.slice_conf["closest_backend"]
+                closest_path, closest_bottleneck = _compute_for_backend(closest_conf)
 
-            # If closest already active (or migration disabled), keep best route anyway.
+                if closest_path is None:
+                    self.logger.warning(
+                        "SLICE=throughput EV=MIGRATE_SKIP reason=%s target=closest cause=no_path_to_target",
+                        reason
+                    )
+                else:
+                    self.logger.warning("SLICE=throughput EV=MIGRATE_TRIGGER reason=%s target=closest", reason)
+                    if self._migrate_to("closest", reason=f"qos_unsatisfied_best_path:{reason}"):
+                        return self.recompute_path(reason="after_migration_qos_unsatisfied")
+
+            # IMPORTANT for availability:
+            # If CLOSEST is active and QoS is unsatisfied, we still keep the best available route.
+            # We only failback on NO PATH (no connectivity), not on QoS degradation.
 
         # -------------------- INSTALL FLOWS IF PATH CHANGED --------------------
         old_path = self.slice_conf.get("current_path")
         if old_path == path:
-            # Keep state consistent even if path doesn't change.
-            self.slice_conf["state"] = "NORMAL_CLOSEST" if self.slice_conf.get(
-                "active_backend") == "closest" else "NORMAL_REMOTE"
             return
 
         self.logger.info(
@@ -165,8 +269,10 @@ class ThroughputSliceManager:
         self.delete_flows()
         self.install_flows(path, backend)
         self.slice_conf["current_path"] = path
+        self.slice_conf["state"] = (
+            "NORMAL_CLOSEST" if self.slice_conf.get("active_backend") == "closest" else "NORMAL_REMOTE"
+        )
 
-        self.slice_conf["state"] = "NORMAL_CLOSEST" if self.slice_conf.get("active_backend") == "closest" else "NORMAL_REMOTE"
 
     def check_qos(self):
         """

@@ -17,7 +17,7 @@ Design goals:
 - Add a high-throughput slice with widest-path routing and VIP NAT, without interfering
   with the low-latency slice.
 
-Monitoring policy (Architecture 2):
+Monitoring policy:
 - Do NOT use LLDP / topology discovery.
 - Topology is known a priori from LINK_PARAMS.
 - PortStats polling implements a Dual-Tier Polling Scheduler:
@@ -50,7 +50,7 @@ from throughput_slice import ThroughputSliceManager
 # -------------------------------------------------------------------
 # Feature flags
 # -------------------------------------------------------------------
-ENABLE_LATENCY_SLICE = False
+ENABLE_LATENCY_SLICE = True
 ENABLE_THROUGHPUT_SLICE = True
 
 
@@ -70,7 +70,7 @@ class SliceQosApp(app_manager.RyuApp):
     """
     SliceQosApp orchestrator.
 
-    Key idea (Architecture 2):
+    Key idea:
       - Do NOT use Ryu topology discovery (--observe-links, LLDP).
       - Treat topology as known a priori via LINK_PARAMS.
       - Consider topology "ready" when all expected switches have connected.
@@ -348,7 +348,7 @@ class SliceQosApp(app_manager.RyuApp):
     # ------------------------------------------------------------------
     def _monitor(self):
         """
-        Semi-passive monitoring (Architecture 2) with Dual-Tier Polling Monitor:
+        Semi-passive monitoring with Dual-Tier Polling Monitor:
 
           - Poll PortStats every MONITOR_INTERVAL_S.
           - Tier A (active, priority): poll ONLY switches on active paths (latency + throughput),

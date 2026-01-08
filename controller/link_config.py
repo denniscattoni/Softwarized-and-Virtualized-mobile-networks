@@ -1,13 +1,13 @@
 # controller/link_config.py
 
 """
-Static logical topology configuration (Architecture 2).
+Static logical topology configuration.
 
 This file does NOT perform discovery.
 It describes the logical topology that the controller considers valid
 for QoS routing and network slicing.
 
-Key assumption of Architecture 2:
+Key assumption:
 - the physical topology is known a priori (controlled lab / demo),
 - the controller only reacts to runtime events (PortStatus, PortStats)
   to update the state of already-known links.
