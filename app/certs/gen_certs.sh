@@ -20,15 +20,12 @@ LISTEN_DNS_3="nginx"
 LISTEN_DNS_4="localhost"
 
 DAYS_VALID=365
-KEY_BITS=2048
 
 CN="${VIP_IP}"
 
 cat > "${CERT_DIR}/openssl.cnf" <<EOF
 [ req ]
-default_bits       = ${KEY_BITS}
 prompt             = no
-default_md         = sha256
 distinguished_name = dn
 x509_extensions    = v3_req
 
@@ -52,8 +49,8 @@ DNS.3 = ${LISTEN_DNS_3}
 DNS.4 = ${LISTEN_DNS_4}
 EOF
 
-# Private key
-openssl genrsa -out "${CERT_DIR}/server.key" "${KEY_BITS}"
+# Private key (Ed25519)
+openssl genpkey -algorithm Ed25519 -out "${CERT_DIR}/server.key"
 
 # Self-signed certificate with SAN
 openssl req -x509 \

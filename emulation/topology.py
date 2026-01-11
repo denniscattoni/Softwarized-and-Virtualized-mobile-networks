@@ -75,11 +75,11 @@ class SlicingTopology(Topo):
         self.addLink(srv2, s5)
 
         # Core links
-        self.addLink(s2, s1, cls=TCLink, bw=12, delay="5ms")
-        self.addLink(s3, s1, cls=TCLink, bw=12, delay="5ms")
-        self.addLink(s4, s1, cls=TCLink, bw=4, delay="3ms")
-        self.addLink(s5, s1, cls=TCLink, bw=7, delay="10ms")
+        self.addLink(s2, s1, cls=TCLink, bw=12, delay="5ms", loss=0.01)
+        self.addLink(s3, s1, cls=TCLink, bw=12, delay="5ms", loss=0.01)
+        self.addLink(s4, s1, cls=TCLink, bw=4, delay="3ms", loss=0.05)
+        self.addLink(s5, s1, cls=TCLink, bw=7, delay="10ms", loss=0.1)
 
         # Cross-links
-        self.addLink(s2, s4, cls=TCLink, bw=10, delay="5ms")
-        self.addLink(s3, s5, cls=TCLink, bw=7, delay="5ms")
+        self.addLink(s2, s4, cls=TCLink, bw=10, delay="5ms", loss=0.02)
+        self.addLink(s3, s5, cls=TCLink, bw=7, delay="5ms", loss=0.02)

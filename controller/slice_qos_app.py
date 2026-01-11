@@ -2,7 +2,7 @@
 # controller/slice_qos_app.py
 
 """
-SliceQosApp Orchestrator
+SliceQosApp Controller
 
 This is the ONLY RyuApp loaded by ryu-manager.
 
@@ -68,7 +68,7 @@ SLICE_FLOW_PRIORITY_THROUGHPUT = 10
 
 class SliceQosApp(app_manager.RyuApp):
     """
-    SliceQosApp orchestrator.
+    SliceQosApp RyuApp - controller.
 
     Key idea:
       - Do NOT use Ryu topology discovery (--observe-links, LLDP).
@@ -157,16 +157,16 @@ class SliceQosApp(app_manager.RyuApp):
         self.monitor_thread = hub.spawn(self._monitor)
 
         self.logger.info(
-            "SLICE=orchestrator EV=INIT expected_switches=%s",
+            "SLICE=Controller EV=INIT expected_switches=%s",
             sorted(self.expected_switches),
         )
         self.logger.info(
-            "SLICE=orchestrator EV=FEATURE_FLAGS latency=%s throughput=%s",
+            "SLICE=Controller EV=FEATURE_FLAGS latency=%s throughput=%s",
             bool(ENABLE_LATENCY_SLICE),
             bool(ENABLE_THROUGHPUT_SLICE),
         )
         self.logger.info(
-            "SLICE=orchestrator EV=FLOW_PRIORITY latency=%s throughput=%s",
+            "SLICE=Controller EV=FLOW_PRIORITY latency=%s throughput=%s",
             int(SLICE_FLOW_PRIORITY_LATENCY),
             int(SLICE_FLOW_PRIORITY_THROUGHPUT),
         )
@@ -187,7 +187,7 @@ class SliceQosApp(app_manager.RyuApp):
         if missing:
             return
 
-        self.logger.info("SLICE=orchestrator EV=TOPO_READY expected_dpids=%s", sorted(self.expected_switches))
+        self.logger.info("SLICE=Controller EV=TOPO_READY expected_dpids=%s", sorted(self.expected_switches))
 
         if ENABLE_LATENCY_SLICE and self.latency_mgr is not None:
             self.latency_mgr.recompute_path(reason="bootstrap_all_switches_connected")
@@ -232,12 +232,12 @@ class SliceQosApp(app_manager.RyuApp):
         if ev.state == MAIN_DISPATCHER:
             if dpid not in self.datapaths:
                 self.datapaths[dpid] = dp
-                self.logger.info("SLICE=orchestrator EV=DP_REGISTER dpid=%s", dpid)
+                self.logger.info("SLICE=Controller EV=DP_REGISTER dpid=%s", dpid)
                 self._bootstrap_if_ready()
 
         elif ev.state == DEAD_DISPATCHER:
             if dpid in self.datapaths:
-                self.logger.warning("SLICE=orchestrator EV=DP_UNREGISTER dpid=%s", dpid)
+                self.logger.warning("SLICE=Controller EV=DP_UNREGISTER dpid=%s", dpid)
                 del self.datapaths[dpid]
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
@@ -301,7 +301,7 @@ class SliceQosApp(app_manager.RyuApp):
                 affected_throughput = affected_throughput or self._edge_in_path((nbr, dpid), thr_path)
 
             self.logger.warning(
-                "SLICE=orchestrator EV=LINK_DOWN seq=%s dpid=%s port=%s nbr=%s",
+                "SLICE=Controller EV=LINK_DOWN seq=%s dpid=%s port=%s nbr=%s",
                 seq, dpid, port_no, nbr
             )
 
@@ -323,7 +323,7 @@ class SliceQosApp(app_manager.RyuApp):
                 self.topo.add_link(nbr, dpid, delay_ms=p["delay_ms"], capacity_mbps=p["capacity_mbps"])
 
             self.logger.info(
-                "SLICE=orchestrator EV=LINK_UP seq=%s dpid=%s port=%s nbr=%s",
+                "SLICE=Controller EV=LINK_UP seq=%s dpid=%s port=%s nbr=%s",
                 seq, dpid, port_no, nbr
             )
 
@@ -384,7 +384,7 @@ class SliceQosApp(app_manager.RyuApp):
             self._last_thr_path = thr_path
 
             # ---------------- Tick header (operator-friendly) ----------------
-            self.logger.info("\nSLICE=orchestrator EV=TICK seq=%s ts=%.3f interval_s=%s", tick, now, MONITOR_INTERVAL_S)
+            self.logger.info("\nSLICE=Controller EV=TICK seq=%s ts=%.3f interval_s=%s", tick, now, MONITOR_INTERVAL_S)
 
             # ---------------- Slice state summary (stable per tick) ----------------
             if ENABLE_LATENCY_SLICE:
@@ -415,7 +415,7 @@ class SliceQosApp(app_manager.RyuApp):
             active_set = set(active_dpids)
 
             if active_dpids:
-                self.logger.info("SLICE=orchestrator EV=POLL_ACTIVE seq=%s dpids=%s", tick, active_dpids)
+                self.logger.info("SLICE=Controller EV=POLL_ACTIVE seq=%s dpids=%s", tick, active_dpids)
 
             # Poll Tier A first (priority). Label per dpid is chosen deterministically:
             # if dpid appears on both paths, label as "active_both".
@@ -466,7 +466,7 @@ class SliceQosApp(app_manager.RyuApp):
                     guard += 1
 
             if sent_bg:
-                self.logger.info("SLICE=orchestrator EV=POLL_RR seq=%s dpids=%s", tick, sent_bg)
+                self.logger.info("SLICE=Controller EV=POLL_RR seq=%s dpids=%s", tick, sent_bg)
 
             # ---------------- QoS checks (managers) ----------------
             if ENABLE_LATENCY_SLICE and self.latency_mgr is not None:
@@ -531,12 +531,12 @@ class SliceQosApp(app_manager.RyuApp):
                         m = self.topo.get_link_metrics(dpid, nbr)
                         if m is None:
                             self.logger.warning(
-                                "SLICE=orchestrator EV=LINK_METRICS_MISSING seq=%s tier=%s label=%s u=%s v=%s port=%s",
+                                "SLICE=Controller EV=LINK_METRICS_MISSING seq=%s tier=%s label=%s u=%s v=%s port=%s",
                                 seq, tier, label, dpid, nbr, port_no
                             )
                         else:
                             self.logger.info(
-                                "SLICE=orchestrator EV=LINK seq=%s tier=%s label=%s u=%s v=%s port=%s "
+                                "SLICE=Controller EV=LINK seq=%s tier=%s label=%s u=%s v=%s port=%s "
                                 "raw=%.3f ewma=%.3f cap=%.1f",
                                 seq, tier, label, dpid, nbr, port_no,
                                 float(m["used_mbps_raw"]), float(m["used_mbps_ewma"]), float(m["capacity_mbps"])
