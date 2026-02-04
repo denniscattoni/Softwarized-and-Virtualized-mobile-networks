@@ -65,10 +65,13 @@ To run the project, the following environment and tools are required:
 ### Setup Instructions
 
 1. **Install ComNetsEmu**  
-   Follow the official ComNetsEmu documentation and set up the Vagrant-based virtual machine ([`here`](https://git.comnets.net/public-repo/comnetsemu#installation)).
+   
+    Follow the official ComNetsEmu documentation and set up the Vagrant-based virtual machine as explained ([`here`](https://git.comnets.net/public-repo/comnetsemu#installation)).
+
 
 2. **Clone the repository**
-   From inside the ComNetsEmu shared directory, run:
+   
+    From inside the ComNetsEmu shared directory, run:
 
    ```bash
    cd /comnetsemu
@@ -76,12 +79,19 @@ To run the project, the following environment and tools are required:
    ```
    
 3. **Start the virtual machine**
+   
    ```bash
    vagrant up comnetsemu
    vagrant ssh comnetsemu
    ```
 
-4. **Run the system**
+4. **Install NetworkX**  
+    
+    After the ComNetsEmu virtual machine has been correctly launched, install the Python **NetworkX** library.  
+    Follow the official NetworkX installation instructions available [`here`](https://networkx.org/documentation/stable/install.html).
+
+
+5. **Run the system**
 
    After the ComNetsEmu virtual machine has been correctly launched, move to the project directory:
    ```bash
@@ -99,13 +109,11 @@ To run the project, the following environment and tools are required:
    - **T2**: Mininet topology and traffic generation / link failure events
    - **T3**: Management-plane interaction (service migration)
 
-
-
+    
 <br>
 
 
-
-## Technologies Used
+## Used Technologies
 
 The project integrates multiple technologies and networking principles in order to emulate a realistic softwarized network environment:
 
