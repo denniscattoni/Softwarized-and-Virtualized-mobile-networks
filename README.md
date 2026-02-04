@@ -11,6 +11,8 @@ For a complete description of the system design, use cases and experimental resu
 
 
 <br>
+<img alt="" src="./resources/net_slice.png" width="100%"><br>
+
 
 ## Project Overview
 
@@ -209,7 +211,7 @@ Although the system is implemented in a controlled emulation environment, the pr
 <br>
 
 
-## Credits
+# Credits
 
 * Dennis Cattoni - Università degli studi di Trento (Unitn), Trento – Italy
   <br> 📨 dennis.cattoni@studenti.unitn.it
