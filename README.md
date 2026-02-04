@@ -58,7 +58,7 @@ To run the project, the following environment and tools are required:
 
 ---
 
-> [!IMPORTANT]
+> [!WARNING]
 > The use of the **ComNetsEmu virtual machine** is strongly recommended in order to ensure compatibility and reproducibility of the experiments.
 
 ---
@@ -111,6 +111,13 @@ To run the project, the following environment and tools are required:
    - **T2**: Mininet topology and traffic generation / link failure events
    - **T3**: Management-plane interaction (service migration)
 
+
+---
+
+> [!IMPORTANT]
+> For further details on the available use cases, as well as on the configuration flags used to enable or disable individual slices and service migration, refer to the complete project report available [`here`]().
+
+---
     
 <br>
 
