@@ -386,23 +386,6 @@ class SliceQosApp(app_manager.RyuApp):
             # ---------------- Tick header (operator-friendly) ----------------
             self.logger.info("\nSLICE=Controller EV=TICK seq=%s ts=%.3f interval_s=%s", tick, now, MONITOR_INTERVAL_S)
 
-            # ---------------- Slice state summary (stable per tick) ----------------
-            if ENABLE_LATENCY_SLICE:
-                p = lat_path
-                state = "DISCONNECTED" if not p else "ACTIVE"
-                self.logger.info("SLICE=latency EV=PATH_STATE seq=%s state=%s path=%s", tick, state, p)
-
-            if ENABLE_THROUGHPUT_SLICE:
-                conf = self.slices.get("throughput", {})
-                p = thr_path
-                state = conf.get("state", "?")
-                backend = conf.get("active_backend", "?")
-                min_mbps = conf.get("min_throughput_mbps", "?")
-                self.logger.info(
-                    "SLICE=throughput EV=PATH_STATE seq=%s state=%s backend=%s min_mbps=%s path=%s",
-                    tick, state, backend, min_mbps, p
-                )
-
             # ---------------- Tier A (active path polling) ----------------
             active_dpids = []
             if lat_path:
@@ -469,11 +452,38 @@ class SliceQosApp(app_manager.RyuApp):
                 self.logger.info("SLICE=Controller EV=POLL_RR seq=%s dpids=%s", tick, sent_bg)
 
             # ---------------- QoS checks (managers) ----------------
+            # NOTE: We run these BEFORE printing PATH_STATE so that fields like
+            #       last_estimated_delay_ms are fresh already at tick 1.
             if ENABLE_LATENCY_SLICE and self.latency_mgr is not None:
                 self.latency_mgr.check_qos()
 
             if ENABLE_THROUGHPUT_SLICE and self.throughput_mgr is not None:
                 self.throughput_mgr.check_qos()
+
+            # ---------------- Slice state summary (stable per tick) ----------------
+            if ENABLE_LATENCY_SLICE:
+                p = lat_path
+                state = "DISCONNECTED" if not p else "ACTIVE"
+
+                conf = self.slices.get("latency", {})
+                est = conf.get("last_estimated_delay_ms")
+                delay_str = "N/A" if (not p) else (f"{float(est):.1f} ms" if est is not None else "unknown")
+
+                self.logger.info(
+                    "SLICE=latency EV=PATH_STATE seq=%s state=%s path=%s delay=%s",
+                    tick, state, p, delay_str
+                )
+
+            if ENABLE_THROUGHPUT_SLICE:
+                conf = self.slices.get("throughput", {})
+                p = thr_path
+                state = conf.get("state", "?")
+                backend = conf.get("active_backend", "?")
+                min_mbps = conf.get("min_throughput_mbps", "?")
+                self.logger.info(
+                    "SLICE=throughput EV=PATH_STATE seq=%s state=%s backend=%s min_mbps=%s path=%s",
+                    tick, state, backend, min_mbps, p
+                )
 
             hub.sleep(MONITOR_INTERVAL_S)
 

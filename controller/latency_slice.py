@@ -143,8 +143,13 @@ class LatencySliceManager:
             return
 
         max_delay = float(self.slice_conf["max_delay_ms"])
+
+        # ---- cost estimation (fresh every tick) ----
         total_cost = self.topo.estimate_path_cost(path, weight_fn=self._latency_weight)
 
+        self.slice_conf["last_estimated_delay_ms"] = float(total_cost)
+
+        # ---- QoS check ----
         if total_cost <= max_delay:
             return
 
