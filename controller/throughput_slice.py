@@ -1,0 +1,617 @@
+# controller/throughput_slice.py
+
+"""
+ThroughputSliceManager: slice-specific logic for the high-throughput slice.
+
+This module MUST NOT define a RyuApp.
+It contains only policy/decision logic and flow programming for the "throughput" slice.
+
+Design goals:
+- Deterministic and debuggable (hard-fail on missing config).
+- Max-min (widest-path) routing using bottleneck residual throughput (bidirectional safety).
+- SDN VIP NAT so the client targets a stable VIP regardless of backend location.
+
+Pipeline:
+- Step 1: VIP + SDN NAT flows
+- Step 2: Widest-path + QoS check (route-first)
+- Step 3: Service migration via REST (service_manager.py)
+"""
+
+from __future__ import annotations
+
+from typing import Dict, List, Any
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+from flow_utils import build_match_for_slice, add_flow, delete_flows_for_cookie
+
+COOKIE_THROUGHPUT = 0xB2_000001
+COOKIE_MASK_ALL = 0xFFFFFFFFFFFFFFFF
+
+
+class ThroughputSliceManager:
+    """
+    Step 1:
+      - Bootstrap:
+          * compute and install the widest path toward the active backend
+            (default: remote = srv2).
+      - Operational:
+          * recompute only when:
+              - QoS violation on the current path, or
+              - a link-down event affects the current path.
+
+    Step 2: Availability-first recovery policy:
+      - If NO path exists toward the active backend:
+          * if active backend is CLOSEST (srv1) and migration is enabled,
+            attempt a failback to REMOTE (srv2) before declaring DISCONNECTED;
+          * if active backend is REMOTE (srv2) and migration is enabled,
+            attempt a migration to CLOSEST (srv1);
+          * only if NO path exists toward ANY backend,
+            enter DISCONNECTED state (current_path=None, flows deleted).
+
+      - If a path exists but QoS is NOT satisfied:
+          * the best available path is still installed (service remains reachable);
+          * migration is considered ONLY when REMOTE is active.
+
+      - On link-up:
+          * the orchestrator triggers a recompute ONLY if the slice is DISCONNECTED.
+
+    Step 3 (migration policy):
+      - QoS-driven migration:
+          * if active backend is REMOTE (srv2) and even the BEST possible path
+            cannot satisfy the minimum throughput constraint,
+            trigger a REST switch to CLOSEST (srv1).
+      - Connectivity-driven migration:
+          * if active backend is CLOSEST (srv1) and becomes unreachable,
+            trigger a REST failback to REMOTE (srv2) before declaring DISCONNECTED.
+
+      - No cooldown or hysteresis:
+          * migrations are immediate and purely event-driven
+            (QoS violation or loss of connectivity).
+    """
+
+    def __init__(
+        self,
+        *,
+        topo,
+        datapaths: Dict[int, Any],
+        slice_conf: Dict[str, Any],
+        next_hop_port: Dict[tuple, int],
+        logger,
+        flow_priority: int,
+        cookie: int = COOKIE_THROUGHPUT,
+    ):
+        self.topo = topo
+        self.datapaths = datapaths
+        self.slice_conf = slice_conf
+        self.next_hop_port = next_hop_port
+        self.logger = logger
+
+        self.flow_priority = int(flow_priority)
+        self.cookie = int(cookie)
+
+        # Sanity checks (fail fast)
+        assert self.slice_conf is not None, "ThroughputSliceManager: slice_conf is None"
+        assert "ingress_switch" in self.slice_conf, "ThroughputSliceManager: missing ingress_switch"
+        assert "ingress_host_port" in self.slice_conf, "ThroughputSliceManager: missing ingress_host_port"
+        assert "min_throughput_mbps" in self.slice_conf, "ThroughputSliceManager: missing min_throughput_mbps"
+        assert "remote_backend" in self.slice_conf, "ThroughputSliceManager: missing remote_backend"
+        assert "closest_backend" in self.slice_conf, "ThroughputSliceManager: missing closest_backend"
+        assert "vip_ip" in self.slice_conf and "vip_mac" in self.slice_conf, "ThroughputSliceManager: missing VIP params"
+        assert "client_ip" in self.slice_conf and "client_mac" in self.slice_conf, "ThroughputSliceManager: missing client identity"
+
+        # Step 3 REST API config
+        assert "service_manager_url" in self.slice_conf, "ThroughputSliceManager: missing service_manager_url"
+        assert "migration_enabled" in self.slice_conf, "ThroughputSliceManager: missing migration_enabled"
+
+    # ------------------------------------------------------------------
+    # Public entry points used by the orchestrator
+    # ------------------------------------------------------------------
+    def recompute_path(self, reason: str = "unspecified"):
+        """
+        Compute and (re)install widest-path toward the ACTIVE backend.
+
+        Widest-path objective:
+          maximize bottleneck residual capacity, using bidirectional safety:
+            hop_residual(u,v) = min(residual(u,v), residual(v,u))
+
+        If no path:
+          - If active is REMOTE and migration is enabled -> try migrate to CLOSEST and recompute
+          - If active is CLOSEST and migration is enabled -> try FAILBACK to REMOTE and recompute
+          - If BOTH backends are unreachable -> DISCONNECTED (clear flows)
+        """
+        ingress = int(self.slice_conf["ingress_switch"])
+        thr_min = float(self.slice_conf["min_throughput_mbps"])
+
+        def _compute_for_backend(backend_conf):
+            egress = int(backend_conf["egress_switch"])
+            p = self.topo.compute_widest_path_bidirectional(ingress, egress)
+            if p is None:
+                return None, None
+            b = self.topo.estimate_path_bottleneck_bidirectional_mbps(p)
+            return p, b
+
+        # --- Attempt 1: current active backend ---
+        backend = self._get_active_backend_conf()
+        path, bottleneck = _compute_for_backend(backend)
+
+        # -------------------- NO PATH (attempt 1) --------------------
+        if path is None:
+            # Decide recovery action:
+            # - If we are on CLOSEST (srv1) and it became unreachable, prefer service availability:
+            #     try failback to REMOTE (srv2) before declaring DISCONNECTED.
+            # - If we are on REMOTE (srv2) and it is unreachable, optionally try migrate to CLOSEST (srv1).
+            # IMPORTANT (anti-loop):
+            #   We will try AT MOST ONE switch of backend in this call.
+            if self._migration_enabled():
+                if not self._is_remote_active():
+                    action = "TRY_FAILBACK_REMOTE"
+                else:
+                    action = "TRY_MIGRATE_CLOSEST"
+            else:
+                action = "DISCONNECT"
+
+            egress = int(backend["egress_switch"])
+            self.logger.warning(
+                "SLICE=throughput EV=NO_PATH reason=%s backend=%s ingress=%s egress=%s action=%s",
+                reason, backend.get("name", "?"), ingress, egress, action
+            )
+
+            # Case 1: active=CLOSEST (srv1) but disconnected -> failback to REMOTE (srv2) first
+            if action == "TRY_FAILBACK_REMOTE":
+                self.logger.warning("SLICE=throughput EV=FAILBACK_TRIGGER reason=%s target=remote", reason)
+                if self._migrate_to("remote", reason=f"no_path_to_closest:{reason}"):
+                    backend2 = self._get_active_backend_conf()
+                    path2, bottleneck2 = _compute_for_backend(backend2)
+                    if path2 is None:
+                        egress2 = int(backend2["egress_switch"])
+                        self.logger.warning(
+                            "SLICE=throughput EV=NO_PATH reason=%s backend=%s ingress=%s egress=%s action=DISCONNECT",
+                            "after_failback_no_path", backend2.get("name", "?"), ingress, egress2
+                        )
+                        self.logger.warning(
+                            "SLICE=throughput EV=DISCONNECTED reason=%s backend=%s ingress=%s egress=%s",
+                            "after_failback_no_path", backend2.get("name", "?"), ingress, egress2
+                        )
+                        self.slice_conf["current_path"] = None
+                        self.slice_conf["state"] = "DISCONNECTED"
+                        self.delete_flows()
+                        return
+
+                    backend = backend2
+                    path = path2
+                    bottleneck = bottleneck2
+                    reason = "after_failback_no_path"
+
+            # Case 2: active=REMOTE (srv2) but disconnected -> try migrate to CLOSEST
+            elif action == "TRY_MIGRATE_CLOSEST":
+                self.logger.warning("SLICE=throughput EV=MIGRATE_TRIGGER reason=%s target=closest", reason)
+                if self._migrate_to("closest", reason=f"no_path_to_remote:{reason}"):
+                    backend2 = self._get_active_backend_conf()
+                    path2, bottleneck2 = _compute_for_backend(backend2)
+                    if path2 is None:
+                        egress2 = int(backend2["egress_switch"])
+                        self.logger.warning(
+                            "SLICE=throughput EV=NO_PATH reason=%s backend=%s ingress=%s egress=%s action=DISCONNECT",
+                            "after_migration_no_path", backend2.get("name", "?"), ingress, egress2
+                        )
+                        self.logger.warning(
+                            "SLICE=throughput EV=DISCONNECTED reason=%s backend=%s ingress=%s egress=%s",
+                            "after_migration_no_path", backend2.get("name", "?"), ingress, egress2
+                        )
+                        self.slice_conf["current_path"] = None
+                        self.slice_conf["state"] = "DISCONNECTED"
+                        self.delete_flows()
+                        return
+
+                    backend = backend2
+                    path = path2
+                    bottleneck = bottleneck2
+                    reason = "after_migration_no_path"
+
+            # No recovery possible (or migration disabled) -> DISCONNECTED
+            else:
+                self.logger.warning(
+                    "SLICE=throughput EV=DISCONNECTED reason=%s backend=%s ingress=%s egress=%s",
+                    reason, backend.get("name", "?"), ingress, int(backend["egress_switch"])
+                )
+                self.slice_conf["current_path"] = None
+                self.slice_conf["state"] = "DISCONNECTED"
+                self.delete_flows()
+                return
+
+        # -------------------- PATH FOUND --------------------
+        self.logger.info(
+            "SLICE=throughput EV=PATH_SELECT reason=%s path=%s bottleneck_mbps=%.2f min_mbps=%.2f backend=%s state=%s",
+            reason, path, float(bottleneck), thr_min, backend.get("name", "?"), self.slice_conf.get("state", "?")
+        )
+
+        # -------------------- BEST PATH STILL UNSATISFIED --------------------
+        if float(bottleneck) < thr_min:
+            self.logger.warning(
+                "SLICE=throughput EV=QOS_UNSAT_BEST reason=%s backend=%s path=%s bottleneck_mbps=%.2f min_mbps=%.2f",
+                reason, backend.get("name", "?"), path, float(bottleneck), thr_min
+            )
+            self._log_path_residuals(path, prefix="SLICE=throughput EV=PATH_RESIDUALS")
+
+            # Immediate migration trigger only when REMOTE is active.
+            # IMPORTANT (anti-oscillation):
+            #   migrate to CLOSEST only if CLOSEST is REACHABLE (path exists).
+            if self._is_remote_active() and self._migration_enabled():
+                closest_conf = self.slice_conf["closest_backend"]
+                closest_path, closest_bottleneck = _compute_for_backend(closest_conf)
+
+                if closest_path is None:
+                    self.logger.warning(
+                        "SLICE=throughput EV=MIGRATE_SKIP reason=%s target=closest cause=no_path_to_target",
+                        reason
+                    )
+                else:
+                    self.logger.warning("SLICE=throughput EV=MIGRATE_TRIGGER reason=%s target=closest", reason)
+                    if self._migrate_to("closest", reason=f"qos_unsatisfied_best_path:{reason}"):
+                        return self.recompute_path(reason="after_migration_qos_unsatisfied")
+
+            # IMPORTANT for availability:
+            # If CLOSEST is active and QoS is unsatisfied, we still keep the best available route.
+            # We only failback on NO PATH (no connectivity), not on QoS degradation.
+
+        # -------------------- INSTALL FLOWS IF PATH CHANGED --------------------
+        old_path = self.slice_conf.get("current_path")
+        if old_path == path:
+            return
+
+        self.logger.info(
+            "SLICE=throughput EV=PATH_INSTALL reason=%s backend=%s path=%s",
+            reason, backend.get("name", "?"), path
+        )
+        self._log_path_residuals(path, prefix="SLICE=throughput EV=PATH_RESIDUALS")
+
+        self.delete_flows()
+        self.install_flows(path, backend)
+        self.slice_conf["current_path"] = path
+        self.slice_conf["state"] = (
+            "NORMAL_CLOSEST" if self.slice_conf.get("active_backend") == "closest" else "NORMAL_REMOTE"
+        )
+
+
+    def check_qos(self):
+        """
+        Evaluate QoS on the CURRENT path; if violated -> recompute.
+
+        QoS: bottleneck_residual_mbps(path) >= min_throughput_mbps
+        (bidirectional safety metric).
+        """
+        if self.slice_conf.get("current_path") is None:
+            return
+
+        # Intercept if someone performed manual migration of the service and resync.
+        if self._sync_backend_from_service_manager():
+            return
+
+        path = self.slice_conf.get("current_path")
+        if not path:
+            return
+
+        thr_min = float(self.slice_conf["min_throughput_mbps"])
+        b = self.topo.estimate_path_bottleneck_bidirectional_mbps(path)
+
+        if b >= thr_min:
+            return
+
+        backend = self._get_active_backend_conf()
+
+        self.logger.warning(
+            "SLICE=throughput EV=QOS_VIOLATION reason=qos_violation path=%s bottleneck_mbps=%.2f min_mbps=%.2f backend=%s state=%s",
+            path, b, thr_min, backend.get("name", "?"), self.slice_conf.get("state", "?")
+        )
+
+        self._log_path_residuals(path, prefix="SLICE=throughput EV=PATH_RESIDUALS")
+        self.recompute_path(reason="qos_violation")
+
+    def on_path_affected(self, reason: str = "path_affected"):
+        self.logger.warning("SLICE=throughput EV=PATH_AFFECTED reason=%s action=RECOMPUTE", reason)
+        self.recompute_path(reason=reason)
+
+    def delete_flows(self):
+        for _, dp in self.datapaths.items():
+            delete_flows_for_cookie(dp, cookie=self.cookie, cookie_mask=COOKIE_MASK_ALL)
+
+    # ------------------------------------------------------------------
+    # Flow programming (VIP NAT + routing)
+    # ------------------------------------------------------------------
+    def install_flows(self, path: List[int], backend_conf: Dict[str, Any]):
+        """
+        Install bidirectional slice rules with VIP NAT:
+
+          FORWARD:  c1 -> VIP:8443  (DNAT VIP->backend on backend edge switch)
+          REVERSE:  backend -> c1   (SNAT backend->VIP on ingress edge switch)
+
+        IMPORTANT:
+          reverse match includes backend_ip, so after migration flows MUST be reinstalled.
+        """
+        ingress = int(self.slice_conf["ingress_switch"])
+        ingress_host_port = int(self.slice_conf["ingress_host_port"])
+
+        vip_ip = str(self.slice_conf["vip_ip"])
+        vip_mac = str(self.slice_conf["vip_mac"])
+
+        client_ip = str(self.slice_conf["client_ip"])
+        client_mac = str(self.slice_conf["client_mac"])
+
+        backend_ip = str(backend_conf["ip"])
+        backend_mac = str(backend_conf["mac"])
+        backend_tcp_port = int(backend_conf["tcp_port"])
+
+        egress_switch = int(backend_conf["egress_switch"])
+        egress_host_port = int(backend_conf["egress_host_port"])
+
+        prio = int(self.flow_priority)
+
+        # ---------- FORWARD (client -> VIP) ----------
+        for idx, dpid in enumerate(path):
+            dp = self.datapaths.get(dpid)
+            if dp is None:
+                continue
+
+            parser = dp.ofproto_parser
+            fwd_match = build_match_for_slice(parser, self.slice_conf)
+
+            if dpid == egress_switch:
+                actions = [
+                    parser.OFPActionSetField(ipv4_dst=backend_ip),
+                    parser.OFPActionSetField(eth_dst=backend_mac),
+                    parser.OFPActionOutput(int(egress_host_port)),
+                ]
+                add_flow(
+                    dp,
+                    priority=prio,
+                    match=fwd_match,
+                    actions=actions,
+                    idle_timeout=0,
+                    hard_timeout=0,
+                    cookie=self.cookie,
+                )
+                continue
+
+            if idx >= len(path) - 1:
+                continue
+
+            next_dpid = path[idx + 1]
+            out_port = self.next_hop_port.get((dpid, next_dpid))
+            if out_port is None:
+                self.logger.warning("SLICE=throughput EV=NO_PORT_MAP direction=fwd u=%s v=%s", dpid, next_dpid)
+                continue
+
+            actions = [parser.OFPActionOutput(int(out_port))]
+            add_flow(
+                dp,
+                priority=prio,
+                match=fwd_match,
+                actions=actions,
+                idle_timeout=0,
+                hard_timeout=0,
+                cookie=self.cookie,
+            )
+
+        # ---------- REVERSE (backend -> client) ----------
+        rev_path = list(reversed(path))
+        for idx, dpid in enumerate(rev_path):
+            dp = self.datapaths.get(dpid)
+            if dp is None:
+                continue
+
+            parser = dp.ofproto_parser
+            rev_match = self._build_reverse_match_for_backend(parser, backend_ip, backend_tcp_port, client_ip)
+
+            if dpid == ingress:
+                actions = [
+                    parser.OFPActionSetField(ipv4_src=vip_ip),
+                    parser.OFPActionSetField(eth_src=vip_mac),
+                    parser.OFPActionSetField(eth_dst=client_mac),
+                    parser.OFPActionOutput(int(ingress_host_port)),
+                ]
+                add_flow(
+                    dp,
+                    priority=prio,
+                    match=rev_match,
+                    actions=actions,
+                    idle_timeout=0,
+                    hard_timeout=0,
+                    cookie=self.cookie,
+                )
+                continue
+
+            if idx >= len(rev_path) - 1:
+                continue
+
+            next_dpid = rev_path[idx + 1]
+            out_port = self.next_hop_port.get((dpid, next_dpid))
+            if out_port is None:
+                self.logger.warning("SLICE=throughput EV=NO_PORT_MAP direction=rev u=%s v=%s", dpid, next_dpid)
+                continue
+
+            actions = [parser.OFPActionOutput(int(out_port))]
+            add_flow(
+                dp,
+                priority=prio,
+                match=rev_match,
+                actions=actions,
+                idle_timeout=0,
+                hard_timeout=0,
+                cookie=self.cookie,
+            )
+
+    # ------------------------------------------------------------------
+    # Step 3: Migration helpers
+    # ------------------------------------------------------------------
+    def _migration_enabled(self) -> bool:
+        return bool(self.slice_conf.get("migration_enabled", False))
+
+    def _is_remote_active(self) -> bool:
+        return self.slice_conf.get("active_backend", "remote") == "remote"
+
+    def _migrate_to(self, target: str, reason: str) -> bool:
+        """
+        Trigger NFV migration via REST and update local state.
+
+        target: "closest" or "remote"
+        """
+        assert target in ("closest", "remote"), f"Throughput: invalid migration target={target}"
+
+        if self.slice_conf.get("active_backend") == target:
+            return True
+
+        to_backend = "srv1" if target == "closest" else "srv2"
+
+        self.logger.warning(
+            "SLICE=throughput EV=MIGRATE reason=%s from=%s to=%s backend_to=%s vip=%s",
+            reason, self.slice_conf.get("active_backend", "?"), target, to_backend, self.slice_conf.get("vip_ip", "?")
+        )
+
+        self.slice_conf["state"] = "MIGRATING"
+
+        ok = self._rest_switch_backend(to_backend)
+        if not ok:
+            self.logger.warning("SLICE=throughput EV=MIGRATE_FAIL reason=%s backend_to=%s", reason, to_backend)
+            self.slice_conf["state"] = "NORMAL_CLOSEST" if self.slice_conf.get("active_backend") == "closest" else "NORMAL_REMOTE"
+            return False
+
+        self.slice_conf["active_backend"] = target
+        self.slice_conf["state"] = "NORMAL_CLOSEST" if target == "closest" else "NORMAL_REMOTE"
+
+        self.logger.warning("SLICE=throughput EV=MIGRATE_OK active_backend=%s backend=%s", target, to_backend)
+        return True
+
+    def _rest_switch_backend(self, to_backend: str) -> bool:
+        """
+        POST /service/switch?to=srv1|srv2
+        Stdlib only (no requests).
+        """
+        base = str(self.slice_conf["service_manager_url"]).rstrip("/")
+        qs = urlencode({"to": to_backend})
+        url = f"{base}/service/switch?{qs}"
+
+        try:
+            req = Request(url, method="POST")
+            with urlopen(req, timeout=2) as resp:
+                body = resp.read().decode("utf-8", errors="replace").strip()
+                status = getattr(resp, "status", None)
+                if status is not None and int(status) != 200:
+                    self.logger.warning("SLICE=throughput EV=REST_ERR endpoint=switch status=%s body=%s", status, body)
+                    return False
+                self.logger.info("SLICE=throughput EV=REST_OK endpoint=switch body=%s", body)
+                return True
+        except Exception as e:
+            self.logger.warning("SLICE=throughput EV=REST_EXC endpoint=switch err=%s", e)
+            return False
+
+    def _sync_backend_from_service_manager(self) -> bool:
+        """
+        Detect manual service placement changes by polling ServiceManager /service/status.
+
+        If placement differs from slice_conf['active_backend'], reconcile by:
+          - updating active_backend/state
+          - clearing current_path
+          - recomputing + installing new flows toward the detected backend
+
+        Returns True if a change was detected and handled (i.e., we triggered a resync).
+        """
+        base = str(self.slice_conf["service_manager_url"]).rstrip("/")
+        url = f"{base}/service/status"
+
+        # Fetch status
+        try:
+            req = Request(url, method="GET")
+            with urlopen(req, timeout=2) as resp:
+                body = resp.read().decode("utf-8", errors="replace").strip()
+                status = getattr(resp, "status", None)
+                if status is not None and int(status) != 200:
+                    self.logger.warning("SLICE=throughput EV=REST_ERR endpoint=status status=%s body=%s", status, body)
+                    return False
+        except Exception as e:
+            self.logger.warning("SLICE=throughput EV=REST_EXC endpoint=status err=%s", e)
+            return False
+
+        # Expected body example:
+        #   "srv1=ON srv2=OFF"
+        srv1_on = "srv1=ON" in body
+        srv2_on = "srv2=ON" in body
+
+        # Ambiguous / invalid states
+        if srv1_on and srv2_on:
+            self.logger.warning("SLICE=throughput EV=SERVICE_STATUS_AMBIG body=%s", body)
+            return False
+
+        if (not srv1_on) and (not srv2_on):
+            self.logger.warning("SLICE=throughput EV=SERVICE_STATUS_EMPTY body=%s", body)
+            return False
+
+        detected = "closest" if srv1_on else "remote"
+        current = self.slice_conf.get("active_backend", "remote")
+
+        if detected == current:
+            return False
+
+        self.logger.warning(
+            "SLICE=throughput EV=MANUAL_PLACEMENT detected=%s was=%s action=RESYNC",
+            detected, current
+        )
+
+        self.slice_conf["active_backend"] = detected
+        self.slice_conf["state"] = "NORMAL_CLOSEST" if detected == "closest" else "NORMAL_REMOTE"
+
+        self.slice_conf["current_path"] = None
+        self.recompute_path(reason="manual_switch_detected")
+        return True
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _get_active_backend_conf(self) -> Dict[str, Any]:
+        ab = self.slice_conf.get("active_backend", "remote")
+        if ab == "remote":
+            return self.slice_conf["remote_backend"]
+        if ab == "closest":
+            return self.slice_conf["closest_backend"]
+        raise AssertionError(f"ThroughputSliceManager: invalid active_backend={ab}")
+
+    def _build_reverse_match_for_backend(self, parser, backend_ip: str, backend_port: int, client_ip: str):
+        return parser.OFPMatch(
+            eth_type=0x0800,
+            ipv4_src=str(backend_ip),
+            ipv4_dst=str(client_ip),
+            ip_proto=6,
+            tcp_src=int(backend_port),
+        )
+
+    def _log_path_residuals(self, path: List[int], prefix: str = "SLICE=throughput EV=PATH_RESIDUALS"):
+        """
+        Log per-hop residual capacity (bidirectional safety) for operator visibility.
+
+        This uses TopologyGraph metrics:
+          residual(u,v) = capacity_mbps - used_mbps (EWMA-smoothed)
+        and prints:
+          u->v:res=... / v->u:res=... (hop=min(...))
+        """
+        if not self.slice_conf.get("log_metrics", False):
+            return
+
+        parts = []
+        for (u, v) in zip(path[:-1], path[1:]):
+            m_fwd = self.topo.get_link_metrics(u, v)
+            m_rev = self.topo.get_link_metrics(v, u)
+            if m_fwd is None or m_rev is None:
+                parts.append(f"{u}<->{v}:MISSING")
+                continue
+
+            res_fwd = float(m_fwd["capacity_mbps"]) - float(m_fwd["used_mbps"])
+            res_rev = float(m_rev["capacity_mbps"]) - float(m_rev["used_mbps"])
+            if res_fwd < 0.0:
+                res_fwd = 0.0
+            if res_rev < 0.0:
+                res_rev = 0.0
+
+            hop_res = min(res_fwd, res_rev)
+            parts.append(f"{u}->{v}:res={res_fwd:.2f} / {v}->{u}:res={res_rev:.2f} (hop={hop_res:.2f})")
+
+        self.logger.info("%s: %s", prefix, " | ".join(parts))
