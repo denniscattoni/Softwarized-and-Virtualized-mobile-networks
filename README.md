@@ -7,7 +7,7 @@ Traffic steering, QoS monitoring, and service migration decisions are centrally 
 
 The work was carried out as part of the **Softwarized and Virtualized Mobile Networks** course (Master’s degree in Computer Science, University of Trento, A.Y. 2025/2026).
 
-For a complete description of the system design, use cases and experimental results, refer to the final project report available [`here`]().
+For a complete description of the system design, use cases and experimental results, refer to the final project report available ([`here`](./resources/Softwarized_and_Virtualized_mobile_networks.pdf)).
 
 
 <br>
@@ -115,7 +115,7 @@ To run the project, the following environment and tools are required:
 ---
 
 > [!IMPORTANT]
-> For further details on the available use cases, as well as on the configuration flags used to enable or disable individual slices and service migration, refer to the complete project report available [`here`]().
+> For further details on the available use cases, as well as on the configuration flags used to enable or disable individual slices and service migration, refer to the complete project report available ([`here`](./resources/Softwarized_and_Virtualized_mobile_networks.pdf)).
 
 ---
     
@@ -192,7 +192,7 @@ Key observations include:
 - **Correct coexistence of multiple slices** over shared network resources, with independent monitoring and decision logic per slice.
 
 Overall, the controller successfully adapts routing and service placement decisions in response to changing network conditions, while maintaining stable and predictable behavior across all evaluated scenarios.  
-For further details, refer to the final report available [`here`](...).
+For further details, refer to the final report available ([`here`](./resources/Softwarized_and_Virtualized_mobile_networks.pdf)).
 
 
 <br>
